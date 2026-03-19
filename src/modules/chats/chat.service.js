@@ -135,6 +135,7 @@ async function getUnreadCount(chatId, userId, clearedAt) {
     deletedForEveryone: false,
     deletedForUsers: { $ne: userId },
     readByUserIds: { $ne: userId },
+    'seenBy.userId': { $ne: userId },
   };
 
   if (clearedAt) {

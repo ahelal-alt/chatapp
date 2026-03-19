@@ -1,4 +1,4 @@
-const { body, param } = require('express-validator');
+const { body, param, query } = require('express-validator');
 const { isValidUrlOrUploadPath } = require('../../utils/validation');
 
 const createGroupValidation = [
@@ -47,7 +47,13 @@ const inviteCodeValidation = [
   param('inviteCode').trim().notEmpty().withMessage('inviteCode is required'),
 ];
 
+const listGroupsValidation = [
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 100 }),
+];
+
 module.exports = {
+  listGroupsValidation,
   createGroupValidation,
   groupIdValidation,
   updateGroupValidation,

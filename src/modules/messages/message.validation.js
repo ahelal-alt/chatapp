@@ -13,6 +13,8 @@ const sendMessageValidation = [
     .optional()
     .custom((value) => isValidUrlOrUploadPath(value))
     .withMessage('thumbnailUrl must be a valid URL or uploaded file path'),
+  body('replyToMessageId').optional().isMongoId().withMessage('replyToMessageId must be a valid message id'),
+  body('forwardedFromMessageId').optional().isMongoId().withMessage('forwardedFromMessageId must be a valid message id'),
   body('latitude').optional().isFloat(),
   body('longitude').optional().isFloat(),
 ];

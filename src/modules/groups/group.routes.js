@@ -8,6 +8,7 @@ const router = express.Router();
 
 router.use(authenticate);
 
+router.get('/', validation.listGroupsValidation, validateRequest, controller.listGroups);
 router.post('/', validation.createGroupValidation, validateRequest, controller.createGroup);
 router.get('/:groupId', validation.groupIdValidation, validateRequest, controller.getGroup);
 router.put('/:groupId', validation.updateGroupValidation, validateRequest, controller.updateGroup);

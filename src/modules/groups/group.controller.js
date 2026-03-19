@@ -2,6 +2,11 @@ const ApiResponse = require('../../utils/ApiResponse');
 const asyncHandler = require('../../utils/asyncHandler');
 const service = require('./group.service');
 
+const listGroups = asyncHandler(async (req, res) => {
+  const result = await service.listGroups(req.user._id, req.query);
+  res.json(new ApiResponse('Groups fetched successfully', result.items, result.meta));
+});
+
 const createGroup = asyncHandler(async (req, res) => {
   const group = await service.createGroup(req.user._id, req.body);
   res.status(201).json(new ApiResponse('Group created successfully', group));
@@ -63,6 +68,7 @@ const joinByInviteCode = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  listGroups,
   createGroup,
   getGroup,
   updateGroup,

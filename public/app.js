@@ -35,6 +35,8 @@ const state = {
   connectedChatId: null,
   theme: 'dark',
   liveConnectionState: 'idle',
+  replyDraft: null,
+  modal: null,
 };
 
 init();
@@ -422,7 +424,9 @@ function readTheme() {
 }
 
 function applyTheme() {
-  document.documentElement.dataset.theme = state.theme;
+  if (document.documentElement) {
+    document.documentElement.dataset.theme = state.theme;
+  }
 }
 
 function disconnectSocket() {
@@ -432,6 +436,7 @@ function disconnectSocket() {
 
   state.socket = null;
   state.connectedChatId = null;
+  state.liveConnectionState = 'idle';
 }
 
 function joinSelectedChatRoom(chatId = state.selectedChatId) {
@@ -498,6 +503,7 @@ function connectLiveSocket() {
   socket.on('connect', () => {
     state.liveConnectionState = 'connected';
     joinSelectedChatRoom();
+    syncChatReceipts(state.selectedChatId);
     render();
   });
 
@@ -506,10 +512,15 @@ function connectLiveSocket() {
     render();
   });
 
+  socket.on('connect_error', () => {
+    state.liveConnectionState = 'disconnected';
+    render();
+  });
+
   socket.on('presence:update', ({ userId, isOnline, lastSeen }) => {
     state.contacts = state.contacts.map((contact) => (
       String(contact.id) === String(userId)
-        ? { ...contact, isOnline, lastSeen: lastSeen || contact.lastSeen }
+        ? { ...contact, isOnline, lastSeen: lastSeen ?? null }
         : contact
     ));
     render();
@@ -521,8 +532,12 @@ function connectLiveSocket() {
       return;
     }
 
-    chat.lastMessagePreview = lastMessagePreview || chat.lastMessagePreview;
-    chat.lastMessageAt = lastMessageAt || chat.lastMessageAt;
+    if (lastMessagePreview !== undefined) {
+      chat.lastMessagePreview = lastMessagePreview;
+    }
+    if (lastMessageAt !== undefined) {
+      chat.lastMessageAt = lastMessageAt;
+    }
     if (Number.isFinite(Number(unreadCount))) {
       chat.unreadCount = Number(unreadCount);
     }
@@ -591,21 +606,23 @@ function connectLiveSocket() {
 
   socket.on('notification:new', (payload) => {
     const notification = normalizeNotification(payload);
+    const existed = state.notifications.some((item) => item.id === notification.id);
     state.notifications = [notification, ...state.notifications.filter((item) => item.id !== notification.id)];
-    state.unreadNotificationCount += notification.isRead ? 0 : 1;
+    if (!existed && !notification.isRead) {
+      state.unreadNotificationCount += 1;
+    }
     render();
   });
 
   socket.on('notification:read', ({ notificationId, all }) => {
     if (all) {
       state.notifications = state.notifications.map((item) => ({ ...item, isRead: true }));
-      state.unreadNotificationCount = 0;
     } else {
       state.notifications = state.notifications.map((item) => (
         item.id === String(notificationId) ? { ...item, isRead: true } : item
       ));
-      state.unreadNotificationCount = Math.max(0, state.unreadNotificationCount - 1);
     }
+    state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
     render();
   });
 
@@ -655,12 +672,13 @@ async function loadLiveWorkspace() {
     render();
 
     profileRes = await apiFetch('/api/v1/users/me');
-    const [chatsRes, contactsRes, incomingRes, outgoingRes, notificationsRes, adminRes] = await Promise.allSettled([
+    const [chatsRes, contactsRes, incomingRes, outgoingRes, notificationsRes, groupsRes, adminRes] = await Promise.allSettled([
       apiFetch('/api/v1/chats?limit=20'),
       apiFetch('/api/v1/contacts?limit=20'),
       apiFetch('/api/v1/contact-requests/incoming?limit=20'),
       apiFetch('/api/v1/contact-requests/outgoing?limit=20'),
       apiFetch('/api/v1/notifications?limit=20'),
+      apiFetch('/api/v1/groups?limit=20'),
       profileRes.data?.user?.role === 'admin'
         ? apiFetch('/api/v1/admin/dashboard')
         : Promise.resolve({ data: null }),
@@ -688,8 +706,11 @@ async function loadLiveWorkspace() {
       ? (notificationsRes.value.data || []).map(normalizeNotification)
       : [];
     state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
+    state.groups = groupsRes.status === 'fulfilled'
+      ? (groupsRes.value.data || []).map(normalizeGroup)
+      : buildGroupsFromChats(state.chats);
     state.admin.summary = adminRes.status === 'fulfilled' ? adminRes.value.data || null : null;
-    state.groups = buildGroupsFromChats(state.chats);
+    applyGroupDetailsToChats();
     state.messagesByChat = {};
     state.typingByChat = {};
     state.selectedChatId = state.chats[0]?.id || null;
@@ -708,6 +729,7 @@ async function loadLiveWorkspace() {
       ['incoming requests', incomingRes],
       ['outgoing requests', outgoingRes],
       ['notifications', notificationsRes],
+      ['groups', groupsRes],
       ['admin dashboard', adminRes],
     ]
       .filter(([, result]) => result.status === 'rejected')
@@ -846,6 +868,23 @@ function normalizeNotification(item) {
   };
 }
 
+function normalizeGroup(group) {
+  return {
+    id: group._id || group.id,
+    chatId: group.chatId?._id || group.chatId || null,
+    name: group.name || 'Untitled group',
+    description: group.description || '',
+    inviteCode: group.inviteCode || '',
+    image: group.image || '',
+    onlyAdminsCanMessage: Boolean(group.onlyAdminsCanMessage),
+    onlyAdminsCanEditInfo: Boolean(group.onlyAdminsCanEditInfo),
+    onlyAdminsCanAddMembers: Boolean(group.onlyAdminsCanAddMembers),
+    memberCount: Number(group.memberCount || 0),
+    currentUserRole: group.currentUserRole || 'member',
+    members: [],
+  };
+}
+
 function normalizeMessage(item) {
   const sender = item.senderId || {};
   const senderId = sender._id || sender.id || item.senderId;
@@ -886,6 +925,33 @@ function buildGroupsFromChats(chats) {
         role: index === 0 ? 'owner' : 'member',
       })),
     }));
+}
+
+function applyGroupDetailsToChats() {
+  const groupsByChatId = new Map(
+    state.groups
+      .filter((group) => group.chatId)
+      .map((group) => [String(group.chatId), group]),
+  );
+
+  state.chats = state.chats.map((chat) => {
+    if (chat.type !== 'group') {
+      return chat;
+    }
+
+    const group = groupsByChatId.get(String(chat.id));
+    if (!group) {
+      return chat;
+    }
+
+    return {
+      ...chat,
+      title: group.name,
+      subtitle: `${group.memberCount || chat.memberCount || 0} members`,
+      avatarImage: group.image || chat.avatarImage,
+      memberCount: group.memberCount || chat.memberCount,
+    };
+  });
 }
 
 async function loadChatMessages(chatId) {
@@ -955,11 +1021,50 @@ function render() {
 function renderLoading() {
   return `
     <div class="loading-shell">
-      <div class="loading-card">
-        <div class="eyebrow">Loading Workspace</div>
-        <h1 class="main-heading">Preparing your chat surfaces.</h1>
-        <p class="helper-text">Fetching your session, recent conversations, contacts, and notification state.</p>
-        <div class="loading-bar" aria-hidden="true"></div>
+      <div class="loading-workspace">
+        <div class="loading-rail skeleton-card">
+          <div class="skeleton skeleton-pill"></div>
+          <div class="skeleton skeleton-avatar"></div>
+          <div class="skeleton skeleton-line"></div>
+          <div class="skeleton skeleton-line short"></div>
+          <div class="skeleton-nav">
+            <div class="skeleton skeleton-line"></div>
+            <div class="skeleton skeleton-line"></div>
+            <div class="skeleton skeleton-line"></div>
+            <div class="skeleton skeleton-line"></div>
+          </div>
+        </div>
+        <div class="loading-list skeleton-card">
+          <div class="skeleton skeleton-pill wide"></div>
+          <div class="skeleton-list">
+            ${Array.from({ length: 6 }, () => `
+              <div class="skeleton-row">
+                <div class="skeleton skeleton-avatar small"></div>
+                <div class="skeleton-copy">
+                  <div class="skeleton skeleton-line"></div>
+                  <div class="skeleton skeleton-line short"></div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        <div class="loading-chat skeleton-card">
+          <div class="skeleton skeleton-pill wide"></div>
+          <div class="skeleton-messages">
+            ${Array.from({ length: 5 }, (_, index) => `
+              <div class="skeleton-message ${index % 2 ? 'mine' : ''}">
+                <div class="skeleton skeleton-bubble ${index % 2 ? 'wide' : ''}"></div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        <div class="loading-info skeleton-card">
+          <div class="skeleton skeleton-pill"></div>
+          <div class="skeleton skeleton-avatar"></div>
+          <div class="skeleton skeleton-line"></div>
+          <div class="skeleton skeleton-line short"></div>
+          <div class="skeleton skeleton-line short"></div>
+        </div>
       </div>
       ${renderToasts()}
     </div>
@@ -1127,8 +1232,8 @@ function renderWorkspace() {
           <button class="ghost-button" type="button" data-action="logout">Log out</button>
         </div>
       </header>
-      <div class="workspace-grid">
-        <aside class="side-panel">
+      <div class="workspace-grid workspace-grid-quad">
+        <aside class="sidebar side-panel">
           <div class="profile-card">
             <div class="row-head">
               ${renderAvatar(state.user?.fullName || 'You', state.user?.profileImage, 'large')}
@@ -1152,15 +1257,28 @@ function renderWorkspace() {
             ${renderNavButton('profile', 'Profile')}
             ${renderNavButton('settings', 'Settings')}
           </div>
-          ${renderSidebarContent(selectedChat)}
         </aside>
-        <main class="main-panel">
+        <section class="chat-list side-panel">
+          <div class="panel-header compact">
+            <div>
+              <h2>${state.activeSection === 'chats' ? 'Inbox' : capitalize(state.activeSection)}</h2>
+              <p>${state.activeSection === 'chats' ? 'Pinned, unread, and recent conversations in one signal-rich list.' : 'Quick access and lightweight navigation for this space.'}</p>
+            </div>
+          </div>
+          <div class="workspace-search">
+            <input class="workspace-search-input" type="search" placeholder="Search conversations, people, groups..." />
+          </div>
+          ${renderSidebarContent(selectedChat)}
+        </section>
+        <main class="chat-window main-panel">
           ${renderMainPanel()}
         </main>
-        <aside class="rail-panel">
+        <aside class="info-panel rail-panel">
           ${renderDetailRail()}
         </aside>
       </div>
+      ${renderMobileDock(unreadCount, pendingCount)}
+      ${renderModal()}
       ${renderToasts()}
     </div>
   `;
@@ -1180,6 +1298,31 @@ function renderNavButton(section, label, count = 0) {
       </div>
       ${count ? `<span class="count-badge ${section === 'notifications' ? 'blue' : ''}">${count}</span>` : ''}
     </button>
+  `;
+}
+
+function renderMobileDock(unreadCount, pendingCount) {
+  const items = [
+    ['chats', 'Chats', state.chats.length],
+    ['contacts', 'Contacts', state.contacts.length],
+    ['requests', 'Requests', pendingCount],
+    ['notifications', 'Alerts', unreadCount],
+  ];
+
+  return `
+    <nav class="mobile-dock" aria-label="Mobile navigation">
+      ${items.map(([section, label, count]) => `
+        <button
+          type="button"
+          class="mobile-dock-item ${state.activeSection === section ? 'is-active' : ''}"
+          data-action="switch-section"
+          data-section="${section}"
+        >
+          <span>${label}</span>
+          ${count ? `<span class="count-badge ${section === 'notifications' ? 'blue' : ''}">${count}</span>` : ''}
+        </button>
+      `).join('')}
+    </nav>
   `;
 }
 
@@ -1402,6 +1545,14 @@ function renderChatsPanel() {
       <div class="composer-card">
         <form id="message-form">
           <input type="hidden" name="chatId" value="${selectedChat.id}" />
+          ${state.replyDraft
+            ? `
+              <div class="reply-chip">
+                Replying to: ${escapeHtml(state.replyDraft.text || 'Attachment')}
+                <button class="ghost-button" type="button" data-action="cancel-reply" style="padding: 8px 10px;">Cancel</button>
+              </div>
+            `
+            : ''}
           <label class="sr-only" for="message-text">Message</label>
           <textarea id="message-text" class="composer-input" name="text" placeholder="Write a message..." rows="4" required></textarea>
           <div class="composer-actions">
@@ -1428,6 +1579,9 @@ function renderMessage(message) {
         ${message.mine ? '' : `<strong>${escapeHtml(message.senderName)}</strong>`}
         <p class="message-text">${escapeHtml(message.text)}</p>
         ${message.mediaUrl ? `<a class="caption" href="${escapeAttribute(message.mediaUrl)}" target="_blank" rel="noreferrer">${escapeHtml(message.fileName || 'Open attachment')}</a>` : ''}
+        <div class="request-actions">
+          <button class="chip-button" type="button" data-action="reply-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reply</button>
+        </div>
         <div class="message-meta">
           <span>${formatTime(message.createdAt)}</span>
           ${message.editedAt ? '<span>edited</span>' : ''}
@@ -1617,7 +1771,7 @@ function renderGroupCard(group) {
 }
 
 function renderNotificationsPanel() {
-  const unread = state.notifications.filter((item) => !item.isRead).length;
+  const unread = state.unreadNotificationCount;
 
   return `
     <div class="panel-header">
@@ -1873,7 +2027,7 @@ function renderDetailRail() {
         <div class="profile-card">
           <strong>Notification health</strong>
           <div class="metrics-grid" style="grid-template-columns: 1fr;">
-            <div class="metric-card"><span>Unread</span><strong>${state.notifications.filter((item) => !item.isRead).length}</strong></div>
+            <div class="metric-card"><span>Unread</span><strong>${state.unreadNotificationCount}</strong></div>
             <div class="metric-card"><span>Total</span><strong>${state.notifications.length}</strong></div>
           </div>
         </div>
@@ -1985,7 +2139,7 @@ function renderRailChat(chat) {
 
 function renderSummaryRail() {
   const unreadChats = state.chats.filter((item) => item.unreadCount > 0).length;
-  const unreadNotifications = state.notifications.filter((item) => !item.isRead).length;
+  const unreadNotifications = state.unreadNotificationCount;
 
   return `
     <div class="profile-card">
@@ -2048,7 +2202,16 @@ async function handleClick(event) {
 
   if (action === 'open-demo') {
     syncDemoState();
+    state.replyDraft = null;
     state.screen = 'workspace';
+    render();
+    return;
+  }
+
+  if (action === 'toggle-theme') {
+    state.theme = state.theme === 'dark' ? 'light' : 'dark';
+    window.localStorage.setItem(THEME_KEY, state.theme);
+    applyTheme();
     render();
     return;
   }
@@ -2059,6 +2222,7 @@ async function handleClick(event) {
     state.token = null;
     state.refreshToken = null;
     state.admin.summary = null;
+    state.replyDraft = null;
     state.screen = 'auth';
     state.authView = 'login';
     pushToast('Logged out', 'Your session has been cleared.', 'success');
@@ -2078,8 +2242,25 @@ async function handleClick(event) {
     return;
   }
 
+  if (action === 'reply-message') {
+    const selectedChat = getSelectedChat();
+    const message = (state.messagesByChat[selectedChat?.id] || []).find((item) => item.id === target.dataset.messageId);
+    if (message) {
+      state.replyDraft = { id: message.id, text: message.text || message.fileName || 'Attachment' };
+      render();
+    }
+    return;
+  }
+
+  if (action === 'cancel-reply') {
+    state.replyDraft = null;
+    render();
+    return;
+  }
+
   if (action === 'select-chat') {
     state.activeSection = 'chats';
+    state.replyDraft = null;
     state.selectedChatId = target.dataset.chatId;
     await loadChatMessages(state.selectedChatId);
     render();
@@ -2288,7 +2469,7 @@ async function handleMessageSubmit(formData, form) {
       senderId: state.user.id,
       senderName: state.user.fullName,
       text,
-      replyText: '',
+      replyText: state.replyDraft?.text || '',
       createdAt: new Date().toISOString(),
       editedAt: null,
       seenCount: 0,
@@ -2300,6 +2481,7 @@ async function handleMessageSubmit(formData, form) {
       chat.lastMessagePreview = text;
       chat.lastMessageAt = message.createdAt;
     }
+    state.replyDraft = null;
     form.reset();
     pushToast('Message sent', 'The demo conversation was updated locally.', 'success');
     render();
@@ -2311,7 +2493,11 @@ async function handleMessageSubmit(formData, form) {
     const response = await apiFetch('/api/v1/messages', {
       method: 'POST',
       headers: {},
-      body: JSON.stringify({ chatId, text }),
+      body: JSON.stringify({
+        chatId,
+        text,
+        replyToMessageId: state.replyDraft?.id || null,
+      }),
     });
     const message = normalizeMessage(response.data);
     const existingMessages = state.messagesByChat[chatId] || [];
@@ -2323,6 +2509,7 @@ async function handleMessageSubmit(formData, form) {
       chat.lastMessagePreview = message.text;
       chat.lastMessageAt = message.createdAt;
     }
+    state.replyDraft = null;
     form.reset();
     pushToast('Message sent', 'The conversation was updated against the live API.', 'success');
     render();
@@ -2402,6 +2589,7 @@ async function openChatWithContact(contactId) {
       } else {
         state.chats.unshift(chat);
       }
+      state.selectedChatId = chat.id;
       await loadChatMessages(chat.id);
     } catch (error) {
       pushToast('Could not open chat', error.message, 'error');
@@ -2437,7 +2625,7 @@ async function handleRequestAction(requestId, kind) {
         isFavorite: false,
       });
     }
-    pushToast('Request updated', `${capitalize(kind)}ed ${request.counterpart.fullName}.`, 'success');
+    pushToast('Request updated', `${pastTense(kind)} ${request.counterpart.fullName}.`, 'success');
     render();
     return;
   }
@@ -2451,7 +2639,7 @@ async function handleRequestAction(requestId, kind) {
     if (kind === 'accept') {
       await refreshContacts();
     }
-    pushToast('Request updated', `${capitalize(kind)}ed ${request.counterpart.fullName}.`, 'success');
+    pushToast('Request updated', `${pastTense(kind)} ${request.counterpart.fullName}.`, 'success');
     render();
   } catch (error) {
     pushToast('Request failed', error.message, 'error');
@@ -2480,6 +2668,7 @@ async function markNotificationRead(notificationId) {
 
   if (state.dataSource === 'demo') {
     notification.isRead = true;
+    state.unreadNotificationCount = Math.max(0, state.unreadNotificationCount - 1);
     pushToast('Notification updated', 'Marked as read.', 'success');
     render();
     return;
@@ -2491,6 +2680,7 @@ async function markNotificationRead(notificationId) {
       headers: {},
     });
     notification.isRead = true;
+    state.unreadNotificationCount = Math.max(0, state.unreadNotificationCount - 1);
     pushToast('Notification updated', 'Marked as read.', 'success');
     render();
   } catch (error) {
@@ -2508,6 +2698,7 @@ async function markAllNotificationsRead() {
 
   if (state.dataSource === 'demo') {
     state.notifications = state.notifications.map((item) => ({ ...item, isRead: true }));
+    state.unreadNotificationCount = 0;
     pushToast('Notifications cleared', 'Every notification is now marked as read.', 'success');
     render();
     return;
@@ -2519,6 +2710,7 @@ async function markAllNotificationsRead() {
       headers: {},
     });
     state.notifications = state.notifications.map((item) => ({ ...item, isRead: true }));
+    state.unreadNotificationCount = 0;
     pushToast('Notifications cleared', 'Every notification is now marked as read.', 'success');
     render();
   } catch (error) {
@@ -2741,4 +2933,14 @@ function relativeTime(value) {
 
 function capitalize(value) {
   return value ? value[0].toUpperCase() + value.slice(1) : '';
+}
+
+function pastTense(value) {
+  const map = {
+    accept: 'Accepted',
+    reject: 'Rejected',
+    cancel: 'Cancelled',
+  };
+
+  return map[value] || `${capitalize(value)}ed`;
 }

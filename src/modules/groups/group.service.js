@@ -6,6 +6,7 @@ const Message = require('../messages/message.model');
 const notificationService = require('../notifications/notification.service');
 const ApiError = require('../../utils/ApiError');
 const { getIO } = require('../../sockets/state');
+const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const {
   ensureActiveUser,
   ensureGroupInviteAllowed,
@@ -102,6 +103,37 @@ async function createGroup(ownerId, payload) {
   }
 
   return group;
+}
+
+async function listGroups(userId, query) {
+  const { page, limit, skip } = getPagination(query);
+  const memberships = await GroupMember.find({ userId })
+    .sort({ joinedAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .populate('groupId');
+
+  const total = await GroupMember.countDocuments({ userId });
+  const groupIds = memberships
+    .map((membership) => membership.groupId?._id)
+    .filter(Boolean);
+
+  const memberCounts = await GroupMember.aggregate([
+    { $match: { groupId: { $in: groupIds } } },
+    { $group: { _id: '$groupId', count: { $sum: 1 } } },
+  ]);
+  const memberCountMap = new Map(memberCounts.map((item) => [String(item._id), item.count]));
+
+  return {
+    items: memberships
+      .filter((membership) => membership.groupId)
+      .map((membership) => ({
+        ...membership.groupId.toObject(),
+        memberCount: memberCountMap.get(String(membership.groupId._id)) || 0,
+        currentUserRole: membership.role,
+      })),
+    meta: buildPaginationMeta({ page, limit, total }),
+  };
 }
 
 async function getGroupDetails(groupId, userId) {
@@ -402,6 +434,7 @@ async function deleteGroup(groupId, userId) {
 }
 
 module.exports = {
+  listGroups,
   createGroup,
   getGroupDetails,
   updateGroup,
