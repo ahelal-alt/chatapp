@@ -507,7 +507,7 @@ function buildLocalPendingMessage(entry) {
     fileName: entry.payload.fileName || '',
     fileSize: Number(entry.payload.fileSize || 0),
     duration: Number(entry.payload.duration || 0),
-    replyText: state.replyDraft?.text || '',
+    replyText: entry.replyText || '',
     createdAt: entry.createdAt,
     editedAt: null,
     pinnedAt: null,
@@ -535,7 +535,7 @@ function upsertMessageForChat(chatId, message) {
 
 async function queueOutboundMessage(entry) {
   await dbPut('outbox', entry);
-  state.offline.pendingCount += 1;
+  state.offline.pendingCount = (await dbGetAll('outbox')).length;
   const localMessage = buildLocalPendingMessage(entry);
   upsertMessageForChat(entry.chatId, localMessage);
   syncFilesHubFromMessage(localMessage);
@@ -547,6 +547,18 @@ async function queueOutboundMessage(entry) {
   await persistChatMessagesCache(entry.chatId);
   await persistWorkspaceCache();
   render();
+}
+
+async function setOutboxEntryState(entryId, deliveryState) {
+  const entry = await dbGet('outbox', entryId);
+  if (!entry) {
+    return;
+  }
+
+  await dbPut('outbox', {
+    ...entry,
+    deliveryState,
+  });
 }
 
 async function hydratePendingOutbox() {
@@ -584,6 +596,7 @@ async function flushPendingOutbox() {
 
   for (const entry of entries) {
     try {
+      await setOutboxEntryState(entry.id, 'sending');
       upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: 'sending' }));
       let payload = { ...entry.payload };
 
@@ -603,13 +616,17 @@ async function flushPendingOutbox() {
         headers: {},
         body: JSON.stringify(payload),
       });
-      const message = normalizeMessage(response.data);
+      let message = normalizeMessage(response.data);
+      if (message.isEncrypted) {
+        message = await decryptMessageContent(message);
+      }
       upsertMessageForChat(entry.chatId, message);
       syncFilesHubFromMessage(message);
       await dbDelete('outbox', entry.id);
       await persistChatMessagesCache(entry.chatId);
     } catch (error) {
       const nextState = error.status ? 'failed' : 'queued';
+      await setOutboxEntryState(entry.id, nextState);
       upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: nextState }));
       if (!error.status) {
         state.offline.isOnline = false;
@@ -1027,6 +1044,8 @@ function clearSession() {
   window.localStorage.removeItem(SESSION_KEY);
 }
 
+let refreshRequestPromise = null;
+
 function readTheme() {
   return window.localStorage.getItem(THEME_KEY) || 'dark';
 }
@@ -1232,6 +1251,16 @@ function connectLiveSocket() {
         ? { ...item, seenCount: Number(item.seenCount || 0) + 1 }
         : item
     ));
+    render();
+  });
+
+  socket.on('message:reactions', ({ chatId, messageId, reactions }) => {
+    state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).map((item) => (
+      item.id === String(messageId)
+        ? { ...item, reactions: normalizeReactions(reactions) }
+        : item
+    ));
+    persistChatMessagesCache(chatId);
     render();
   });
 
@@ -1601,6 +1630,7 @@ function normalizeMessage(item) {
     ciphertextIv: item.ciphertextIv || '',
     encryptionVersion: Number(item.encryptionVersion || 0),
     encryptedKeys: Array.isArray(item.encryptedKeys) ? item.encryptedKeys : [],
+    reactions: normalizeReactions(item.reactions || []),
     replyText: item.replyToMessageId?.text || '',
     createdAt: item.createdAt,
     editedAt: item.editedAt || null,
@@ -1813,19 +1843,84 @@ async function loadFilesHub({ silent = false } = {}) {
   }
 }
 
-async function apiFetch(path, options = {}) {
+async function refreshAccessToken() {
+  if (!state.refreshToken) {
+    throw new Error('No refresh token available');
+  }
+
+  if (!refreshRequestPromise) {
+    refreshRequestPromise = fetch('/api/v1/auth/refresh-token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        refreshToken: state.refreshToken,
+      }),
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const error = new Error(payload.message || 'Session refresh failed');
+          error.status = response.status;
+          throw error;
+        }
+
+        state.token = payload.data?.tokens?.accessToken || null;
+        state.refreshToken = payload.data?.tokens?.refreshToken || state.refreshToken;
+        writeSession({
+          token: state.token,
+          refreshToken: state.refreshToken,
+        });
+      })
+      .finally(() => {
+        refreshRequestPromise = null;
+      });
+  }
+
+  return refreshRequestPromise;
+}
+
+async function apiFetch(path, options = {}, retry = { attemptedRefresh: false }) {
   const headers = new Headers(options.headers || {});
-  headers.set('Content-Type', 'application/json');
+  if (options.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
   if (state.token) {
     headers.set('Authorization', `Bearer ${state.token}`);
   }
 
-  const response = await fetch(path, {
-    ...options,
-    headers,
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers,
+    });
+  } catch (error) {
+    const networkError = new Error('Network request failed');
+    networkError.cause = error;
+    throw networkError;
+  }
 
   const payload = await response.json().catch(() => ({}));
+
+  if (
+    response.status === 401
+    && state.refreshToken
+    && !retry.attemptedRefresh
+    && path !== '/api/v1/auth/refresh-token'
+    && path !== '/api/v1/auth/login'
+    && path !== '/api/v1/auth/register'
+  ) {
+    try {
+      await refreshAccessToken();
+      return apiFetch(path, options, { attemptedRefresh: true });
+    } catch (error) {
+      clearSession();
+      state.token = null;
+      state.refreshToken = null;
+    }
+  }
 
   if (!response.ok) {
     const error = new Error(payload.message || 'Request failed');
@@ -2030,6 +2125,7 @@ async function sendVoiceDraft(chatId) {
     clientMessageId,
     chatId,
     plaintext: text,
+    replyText: state.replyDraft?.text || '',
     createdAt: new Date().toISOString(),
     deliveryState: 'queued',
     previewUrl: state.voiceDraft.previewUrl,
@@ -2075,7 +2171,7 @@ async function sendVoiceDraft(chatId) {
       chat.lastMessageAt = message.createdAt;
     }
     state.replyDraft = null;
-    state.voiceDraft = null;
+    discardVoiceDraft({ silent: true });
     pushToast('Voice message ready', 'The demo conversation now includes your recorded note.', 'success');
     render();
     return;
@@ -2084,8 +2180,9 @@ async function sendVoiceDraft(chatId) {
   if (!state.offline.isOnline) {
     await queueOutboundMessage(queueEntry);
     state.replyDraft = null;
-    state.voiceDraft = null;
+    discardVoiceDraft({ silent: true });
     pushToast('Voice queued', 'The voice message will upload automatically when the connection returns.', 'info');
+    render();
     return;
   }
 
@@ -2129,7 +2226,7 @@ async function sendVoiceDraft(chatId) {
     if (!error.status) {
       await queueOutboundMessage(queueEntry);
       state.replyDraft = null;
-      state.voiceDraft = null;
+      discardVoiceDraft({ silent: true });
       pushToast('Voice queued', 'The network dropped, so the voice note was queued locally.', 'info');
     } else {
       pushToast('Voice send failed', error.message, 'error');
@@ -3023,6 +3120,7 @@ function renderMessage(message) {
   const isVoice = message.type === 'voice';
   const isPending = ['queued', 'sending', 'failed'].includes(message.deliveryState);
   const visibleText = message.isEncrypted ? (message.decryptedText || 'Encrypted message') : message.text;
+  const reactions = aggregateReactions(message.reactions || []);
 
   return `
     <article class="message-row ${message.mine ? 'mine' : ''}">
@@ -3048,9 +3146,16 @@ function renderMessage(message) {
             ? `<a class="message-attachment-preview" href="${escapeAttribute(message.mediaUrl)}" target="_blank" rel="noreferrer"><img src="${escapeAttribute(message.mediaUrl)}" alt="${escapeAttribute(message.fileName || 'Attachment')}" /></a>`
             : `<a class="message-file-card" href="${escapeAttribute(message.mediaUrl)}" target="_blank" rel="noreferrer"><strong>${escapeHtml(message.fileName || 'Attachment')}</strong><span class="caption">${escapeHtml(message.type || 'file')} • ${formatFileSize(message.fileSize || 0)}</span></a>`
           : ''}
+        ${reactions.length
+          ? `<div class="message-reactions">${reactions.map((item) => `<span class="reaction-chip">${escapeHtml(item.emoji)} ${item.count}</span>`).join('')}</div>`
+          : ''}
         <div class="request-actions message-actions-row">
           <button class="chip-button" type="button" data-action="reply-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reply</button>
           <button class="chip-button" type="button" data-action="react-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reaction</button>
+          ${message.mine && message.type === 'text' && !message.isEncrypted
+            ? `<button class="chip-button" type="button" data-action="edit-message" data-message-id="${message.id}" style="padding: 8px 12px;">Edit</button>`
+            : ''}
+          <button class="chip-button" type="button" data-action="delete-message" data-message-id="${message.id}" style="padding: 8px 12px;">Delete</button>
           ${message.deliveryState === 'failed'
             ? `<button class="chip-button" type="button" data-action="retry-message" data-message-id="${message.id}" style="padding: 8px 12px;">Retry</button>`
             : ''}
@@ -3718,6 +3823,47 @@ function renderModal() {
     return '';
   }
 
+  let content = state.modal.content || '';
+
+  if (state.modal.type === 'reaction-picker') {
+    const emojiOptions = ['👍', '❤️', '😂', '🔥', '👏', '😮'];
+    content = `
+      <div class="reaction-picker">
+        ${emojiOptions.map((emoji) => `
+          <button class="chip-button reaction-option" type="button" data-action="choose-reaction" data-emoji="${emoji}" data-message-id="${state.modal.messageId}">${emoji}</button>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  if (state.modal.type === 'edit-message') {
+    content = `
+      <form id="edit-message-form" class="form-stack">
+        <input type="hidden" name="messageId" value="${escapeAttribute(state.modal.messageId)}" />
+        <div class="field">
+          <label for="edit-message-text">Message</label>
+          <textarea id="edit-message-text" name="text" rows="4" required>${escapeHtml(state.modal.value || '')}</textarea>
+        </div>
+        <div class="request-actions">
+          <button class="ghost-button" type="button" data-action="close-modal">Cancel</button>
+          <button class="primary-button" type="submit">Save changes</button>
+        </div>
+      </form>
+    `;
+  }
+
+  if (state.modal.type === 'confirm-delete') {
+    content = `
+      <div class="form-stack">
+        <p>${escapeHtml(state.modal.description || 'This action cannot be undone.')}</p>
+        <div class="request-actions">
+          <button class="ghost-button" type="button" data-action="close-modal">Cancel</button>
+          <button class="primary-button" type="button" data-action="confirm-delete-message" data-message-id="${state.modal.messageId}" data-delete-mode="${state.modal.deleteMode}">Delete</button>
+        </div>
+      </div>
+    `;
+  }
+
   return `
     <div class="modal-overlay">
       <div class="modal-card" role="dialog" aria-modal="true" aria-label="${escapeAttribute(state.modal.title)}">
@@ -3729,7 +3875,7 @@ function renderModal() {
           <button class="ghost-button icon-button" type="button" data-action="close-modal">×</button>
         </div>
         <div class="modal-body">
-          ${state.modal.content || ''}
+          ${content}
         </div>
       </div>
     </div>
@@ -3862,12 +4008,62 @@ async function handleClick(event) {
   }
 
   if (action === 'react-message') {
-    pushToast('Reactions', 'Reaction controls are now visually staged and can be connected to the backend next.', 'info');
+    state.modal = {
+      type: 'reaction-picker',
+      title: 'Add reaction',
+      description: 'Pick a quick reaction for this message.',
+      messageId: target.dataset.messageId,
+    };
+    render();
+    return;
+  }
+
+  if (action === 'choose-reaction') {
+    await saveReaction(target.dataset.messageId, target.dataset.emoji);
     return;
   }
 
   if (action === 'retry-message') {
     await retryPendingMessage(target.dataset.messageId);
+    return;
+  }
+
+  if (action === 'edit-message') {
+    const selectedChat = getSelectedChat();
+    const message = (state.messagesByChat[selectedChat?.id] || []).find((item) => item.id === target.dataset.messageId);
+    if (message) {
+      state.modal = {
+        type: 'edit-message',
+        title: 'Edit message',
+        description: 'Update the text and save it back into the conversation.',
+        messageId: message.id,
+        value: message.text || '',
+      };
+      render();
+    }
+    return;
+  }
+
+  if (action === 'delete-message') {
+    const selectedChat = getSelectedChat();
+    const message = (state.messagesByChat[selectedChat?.id] || []).find((item) => item.id === target.dataset.messageId);
+    if (message) {
+      state.modal = {
+        type: 'confirm-delete',
+        title: message.mine ? 'Delete message for everyone' : 'Delete message for you',
+        description: message.mine
+          ? 'This will remove the message for everyone in the conversation.'
+          : 'This will remove the message only from your workspace.',
+        messageId: message.id,
+        deleteMode: message.mine ? 'everyone' : 'me',
+      };
+      render();
+    }
+    return;
+  }
+
+  if (action === 'confirm-delete-message') {
+    await deleteMessageAction(target.dataset.messageId, target.dataset.deleteMode);
     return;
   }
 
@@ -3988,6 +4184,11 @@ async function handleSubmit(event) {
     return;
   }
 
+  if (form.id === 'edit-message-form') {
+    await handleEditMessageSave(new FormData(form));
+    return;
+  }
+
   if (form.id === 'profile-form') {
     await handleProfileSave(new FormData(form));
     return;
@@ -4103,6 +4304,128 @@ async function handleForgotPassword(formData) {
   }
 }
 
+async function handleEditMessageSave(formData) {
+  const messageId = String(formData.get('messageId') || '');
+  const text = String(formData.get('text') || '').trim();
+  if (!messageId || !text) {
+    pushToast('Edit failed', 'Message text is required.', 'error');
+    return;
+  }
+
+  const selectedChat = getSelectedChat();
+  if (!selectedChat) {
+    return;
+  }
+
+  if (state.dataSource === 'demo') {
+    state.messagesByChat[selectedChat.id] = (state.messagesByChat[selectedChat.id] || []).map((item) => (
+      item.id === messageId ? { ...item, text, editedAt: new Date().toISOString() } : item
+    ));
+    recalculateChatFromMessages(selectedChat.id);
+    state.modal = null;
+    render();
+    return;
+  }
+
+  try {
+    const response = await apiFetch(`/api/v1/messages/${messageId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ text }),
+    });
+    let message = normalizeMessage(response.data);
+    if (message.isEncrypted) {
+      message = await decryptMessageContent(message);
+    }
+    upsertMessageForChat(selectedChat.id, message);
+    recalculateChatFromMessages(selectedChat.id);
+    await persistChatMessagesCache(selectedChat.id);
+    state.modal = null;
+    pushToast('Message updated', 'The message has been edited.', 'success');
+    render();
+  } catch (error) {
+    pushToast('Edit failed', error.message, 'error');
+    render();
+  }
+}
+
+async function deleteMessageAction(messageId, deleteMode = 'everyone') {
+  const selectedChat = getSelectedChat();
+  if (!selectedChat || !messageId) {
+    return;
+  }
+
+  if (state.dataSource === 'demo') {
+    state.messagesByChat[selectedChat.id] = (state.messagesByChat[selectedChat.id] || []).filter((item) => item.id !== messageId);
+    recalculateChatFromMessages(selectedChat.id);
+    state.modal = null;
+    render();
+    return;
+  }
+
+  try {
+    await apiFetch(
+      deleteMode === 'me' ? `/api/v1/messages/${messageId}/for-me` : `/api/v1/messages/${messageId}`,
+      { method: 'DELETE' },
+    );
+    state.messagesByChat[selectedChat.id] = (state.messagesByChat[selectedChat.id] || []).filter((item) => item.id !== messageId);
+    state.filesHub.items = state.filesHub.items.filter((item) => item.messageId !== messageId);
+    recalculateChatFromMessages(selectedChat.id);
+    await persistChatMessagesCache(selectedChat.id);
+    state.modal = null;
+    pushToast('Message deleted', deleteMode === 'me' ? 'The message was removed from your view.' : 'The message was deleted for everyone.', 'success');
+    render();
+  } catch (error) {
+    pushToast('Delete failed', error.message, 'error');
+    render();
+  }
+}
+
+async function saveReaction(messageId, emoji) {
+  const selectedChat = getSelectedChat();
+  if (!selectedChat || !messageId || !emoji) {
+    return;
+  }
+
+  const currentMessage = (state.messagesByChat[selectedChat.id] || []).find((item) => item.id === messageId);
+  if (!currentMessage) {
+    return;
+  }
+
+  const myReaction = (currentMessage.reactions || []).find((item) => String(item.userId) === String(state.user?.id));
+
+  if (state.dataSource === 'demo') {
+    const nextReactions = myReaction?.emoji === emoji
+      ? (currentMessage.reactions || []).filter((item) => String(item.userId) !== String(state.user?.id))
+      : [
+        ...(currentMessage.reactions || []).filter((item) => String(item.userId) !== String(state.user?.id)),
+        { userId: state.user.id, emoji },
+      ];
+    upsertMessageForChat(selectedChat.id, { ...currentMessage, reactions: nextReactions });
+    state.modal = null;
+    render();
+    return;
+  }
+
+  try {
+    const response = myReaction?.emoji === emoji
+      ? await apiFetch(`/api/v1/messages/${messageId}/reactions`, { method: 'DELETE' })
+      : await apiFetch(`/api/v1/messages/${messageId}/reactions`, {
+        method: 'POST',
+        body: JSON.stringify({ emoji }),
+      });
+    upsertMessageForChat(selectedChat.id, {
+      ...currentMessage,
+      reactions: normalizeReactions(response.data || []),
+    });
+    await persistChatMessagesCache(selectedChat.id);
+    state.modal = null;
+    render();
+  } catch (error) {
+    pushToast('Reaction failed', error.message, 'error');
+    render();
+  }
+}
+
 function setSessionFromAuth(data) {
   state.token = data?.tokens?.accessToken || null;
   state.refreshToken = data?.tokens?.refreshToken || null;
@@ -4137,6 +4460,7 @@ async function handleMessageSubmit(formData, form) {
     localId: `local-${clientMessageId}`,
     clientMessageId,
     chatId,
+    replyText: state.replyDraft?.text || '',
     createdAt: new Date().toISOString(),
     deliveryState: 'queued',
     payload: {
@@ -4613,6 +4937,41 @@ function isE2EEActiveForChat(chat) {
       && state.e2ee.ready
       && (chat.e2eeCapable || chat.partnerPublicKey),
   );
+}
+
+function recalculateChatFromMessages(chatId) {
+  const chat = state.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return;
+  }
+
+  const latest = (state.messagesByChat[chatId] || []).slice(-1)[0];
+  if (!latest) {
+    chat.lastMessagePreview = 'No messages yet';
+    chat.lastMessageAt = new Date().toISOString();
+    return;
+  }
+
+  chat.lastMessagePreview = latest.isEncrypted
+    ? (latest.decryptedText || 'Encrypted message')
+    : (latest.text || latest.fileName || capitalize(latest.type || 'message'));
+  chat.lastMessageAt = latest.createdAt;
+}
+
+function normalizeReactions(items = []) {
+  return items.map((item) => ({
+    emoji: item.emoji,
+    userId: item.userId?._id || item.userId?.id || item.userId,
+  }));
+}
+
+function aggregateReactions(items = []) {
+  const grouped = new Map();
+  for (const item of items) {
+    const current = grouped.get(item.emoji) || 0;
+    grouped.set(item.emoji, current + 1);
+  }
+  return Array.from(grouped.entries()).map(([emoji, count]) => ({ emoji, count }));
 }
 
 function pushToast(title, message, type = 'info') {
