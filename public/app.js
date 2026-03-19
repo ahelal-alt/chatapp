@@ -3,6 +3,15 @@ const SESSION_KEY = 'pulsechat-session';
 const THEME_KEY = 'pulsechat-theme';
 const APP_DB_NAME = 'pulsechat-app-db';
 const APP_DB_VERSION = 1;
+const TAB_ID = window.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const REALTIME_CHANNEL_NAME = 'pulsechat-realtime';
+const REALTIME_LEADER_LOCK_KEY = 'pulsechat-realtime-leader';
+const REALTIME_SIGNAL_KEY = 'pulsechat-realtime-signal';
+const OUTBOX_OWNER_KEY = 'pulsechat-outbox-owner';
+const LEADER_HEARTBEAT_MS = 3000;
+const LEADER_STALE_MS = 10000;
+const OUTBOX_STALE_MS = 12000;
+const REALTIME_EVENT_TTL_MS = 4000;
 
 const demoWorkspace = createDemoWorkspace();
 
@@ -66,6 +75,12 @@ const state = {
   replyDraft: null,
   voiceDraft: null,
   voiceRecorder: createInitialVoiceRecorderState(),
+  coordination: {
+    tabId: TAB_ID,
+    isLeader: false,
+    leaderId: '',
+    hasBroadcastChannel: Boolean(window.BroadcastChannel),
+  },
   modal: null,
 };
 
@@ -82,6 +97,12 @@ window.addEventListener('pagehide', () => {
 
 let appDbPromise = null;
 const trackedObjectUrls = new Set();
+const processedRealtimeEvents = new Map();
+let coordinationChannel = null;
+let leadershipHeartbeatTimer = null;
+let typingEmitAt = 0;
+let realtimeSignalSequence = 0;
+let joinedSocketRooms = new Set();
 
 init();
 
@@ -168,6 +189,599 @@ async function dbDelete(storeName, key) {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function readStorageJson(key) {
+  try {
+    return JSON.parse(window.localStorage.getItem(key) || 'null');
+  } catch (error) {
+    return null;
+  }
+}
+
+function writeStorageJson(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch (error) {
+    // Ignore storage quota and private-mode failures for coordination state.
+  }
+}
+
+function removeStorageKey(key) {
+  try {
+    window.localStorage.removeItem(key);
+  } catch (error) {
+    // Ignore storage failures for coordination cleanup.
+  }
+}
+
+function isFreshLock(lock, ttlMs) {
+  return Boolean(lock?.tabId && (nowMs() - Number(lock.updatedAt || 0)) < ttlMs);
+}
+
+function readLeaderLock() {
+  return readStorageJson(REALTIME_LEADER_LOCK_KEY);
+}
+
+function readOutboxOwner() {
+  return readStorageJson(OUTBOX_OWNER_KEY);
+}
+
+function isRealtimeLeader() {
+  return state.coordination.isLeader;
+}
+
+function canHoldRealtimeLeadership() {
+  return Boolean(state.token && state.dataSource === 'api');
+}
+
+function pruneRealtimeEvents() {
+  const currentTime = nowMs();
+  for (const [key, expiresAt] of processedRealtimeEvents.entries()) {
+    if (expiresAt <= currentTime) {
+      processedRealtimeEvents.delete(key);
+    }
+  }
+}
+
+function rememberRealtimeEvent(key, ttlMs = REALTIME_EVENT_TTL_MS) {
+  pruneRealtimeEvents();
+  const currentTime = nowMs();
+  const expiresAt = processedRealtimeEvents.get(key) || 0;
+  if (expiresAt > currentTime) {
+    return false;
+  }
+
+  processedRealtimeEvents.set(key, currentTime + ttlMs);
+  return true;
+}
+
+function serializeReactionSignature(reactions = []) {
+  return normalizeReactions(reactions)
+    .map((item) => `${item.userId}:${item.emoji}`)
+    .sort()
+    .join('|');
+}
+
+function getRealtimeEventKey(kind, payload = {}) {
+  switch (kind) {
+    case 'presence:update':
+      return `${kind}:${payload.userId}:${payload.isOnline}:${payload.lastSeen || ''}`;
+    case 'chat:updated':
+      return `${kind}:${payload.chatId}:${payload.lastMessageAt || ''}:${payload.unreadCount ?? ''}:${payload.lastMessagePreview || ''}`;
+    case 'message:new':
+      return `${kind}:${payload._id || payload.id || ''}:${payload.clientMessageId || ''}`;
+    case 'message:updated':
+      return `${kind}:${payload._id || payload.id || ''}:${payload.editedAt || payload.updatedAt || payload.createdAt || ''}`;
+    case 'message:deleted':
+      return `${kind}:${payload.chatId}:${payload.messageId}`;
+    case 'message:seen':
+      return `${kind}:${payload.chatId}:${payload.messageId}`;
+    case 'message:reactions':
+      return `${kind}:${payload.chatId}:${payload.messageId}:${serializeReactionSignature(payload.reactions || [])}`;
+    case 'message:typing':
+      return `${kind}:${payload.chatId}:${payload.fullName || ''}`;
+    case 'message:stop-typing':
+      return `${kind}:${payload.chatId}`;
+    case 'notification:new':
+      return `${kind}:${payload._id || payload.id || ''}`;
+    case 'notification:read':
+      return `${kind}:${payload.all ? 'all' : payload.notificationId || ''}`;
+    case 'notification:count':
+      return `${kind}:${payload.unreadCount ?? ''}`;
+    default:
+      return `${kind}:${JSON.stringify(payload)}`;
+  }
+}
+
+function shouldProcessRealtimeEvent(kind, payload) {
+  const ttl = kind === 'message:seen' || kind === 'message:typing' || kind === 'message:stop-typing'
+    ? 1200
+    : REALTIME_EVENT_TTL_MS;
+  return rememberRealtimeEvent(getRealtimeEventKey(kind, payload), ttl);
+}
+
+function buildRealtimeSignal(type, payload = {}) {
+  return {
+    id: `${TAB_ID}:${++realtimeSignalSequence}:${nowMs()}`,
+    tabId: TAB_ID,
+    type,
+    payload,
+    ts: nowMs(),
+  };
+}
+
+function postRealtimeSignal(type, payload = {}) {
+  const message = buildRealtimeSignal(type, payload);
+  if (coordinationChannel) {
+    coordinationChannel.postMessage(message);
+    return;
+  }
+
+  writeStorageJson(REALTIME_SIGNAL_KEY, message);
+  removeStorageKey(REALTIME_SIGNAL_KEY);
+}
+
+function updateLeaderState(tabId, isLeader) {
+  state.coordination.isLeader = isLeader;
+  state.coordination.leaderId = tabId || '';
+  state.liveConnectionState = isLeader
+    ? state.liveConnectionState
+    : (state.dataSource === 'api' && state.token ? 'standby' : 'idle');
+}
+
+async function refreshPendingOutboxCount() {
+  state.offline.pendingCount = (await dbGetAll('outbox')).length;
+}
+
+function releaseOutboxOwnership() {
+  const lock = readOutboxOwner();
+  if (lock?.tabId === TAB_ID) {
+    removeStorageKey(OUTBOX_OWNER_KEY);
+  }
+}
+
+function acquireOutboxOwnership() {
+  if (!isRealtimeLeader()) {
+    return false;
+  }
+
+  const current = readOutboxOwner();
+  if (isFreshLock(current, OUTBOX_STALE_MS) && current.tabId !== TAB_ID) {
+    return false;
+  }
+
+  const next = {
+    tabId: TAB_ID,
+    updatedAt: nowMs(),
+  };
+  writeStorageJson(OUTBOX_OWNER_KEY, next);
+  return readOutboxOwner()?.tabId === TAB_ID;
+}
+
+function renewOutboxOwnership() {
+  const current = readOutboxOwner();
+  if (current?.tabId !== TAB_ID) {
+    return false;
+  }
+
+  writeStorageJson(OUTBOX_OWNER_KEY, {
+    tabId: TAB_ID,
+    updatedAt: nowMs(),
+  });
+  return true;
+}
+
+async function reconcileRealtimeState({ refreshActiveChat = true } = {}) {
+  if (state.dataSource !== 'api' || !state.token) {
+    return;
+  }
+
+  const [chatsRes, notificationsRes] = await Promise.allSettled([
+    apiFetch('/api/v1/chats?limit=20'),
+    apiFetch('/api/v1/notifications?limit=20'),
+  ]);
+
+  if (chatsRes.status === 'fulfilled') {
+    const selectedChatId = state.selectedChatId;
+    state.chats = (chatsRes.value.data || []).map((item) => normalizeChat(item, state.user));
+    applyGroupDetailsToChats();
+    state.selectedChatId = state.chats.some((item) => item.id === selectedChatId)
+      ? selectedChatId
+      : state.chats[0]?.id || null;
+  }
+
+  if (notificationsRes.status === 'fulfilled') {
+    state.notifications = (notificationsRes.value.data || []).map(normalizeNotification);
+    state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
+  }
+
+  if (refreshActiveChat && state.selectedChatId) {
+    await loadChatMessages(state.selectedChatId);
+  }
+
+  render();
+}
+
+function emitSocketCommand(kind, payload = {}) {
+  if (isRealtimeLeader() && state.socket?.connected) {
+    state.socket.emit(kind, payload);
+    return;
+  }
+
+  postRealtimeSignal('emit-socket', { kind, payload });
+}
+
+function broadcastSocketEvent(kind, payload) {
+  if (!isRealtimeLeader()) {
+    return;
+  }
+
+  postRealtimeSignal('socket-event', { kind, payload });
+}
+
+function syncSocketChatRooms() {
+  if (!isRealtimeLeader() || !state.socket?.connected) {
+    return;
+  }
+
+  const desiredRooms = new Set(state.chats.map((chat) => String(chat.id)));
+  for (const chatId of desiredRooms) {
+    if (!joinedSocketRooms.has(chatId)) {
+      state.socket.emit('chat:join', { chatId });
+      joinedSocketRooms.add(chatId);
+    }
+  }
+
+  for (const chatId of [...joinedSocketRooms]) {
+    if (!desiredRooms.has(chatId)) {
+      state.socket.emit('chat:leave', { chatId });
+      joinedSocketRooms.delete(chatId);
+    }
+  }
+
+  state.connectedChatId = state.selectedChatId || null;
+}
+
+async function applyRealtimeEvent(kind, payload, { broadcast = false } = {}) {
+  if (!shouldProcessRealtimeEvent(kind, payload)) {
+    return;
+  }
+
+  switch (kind) {
+    case 'presence:update': {
+      state.contacts = state.contacts.map((contact) => (
+        String(contact.id) === String(payload.userId)
+          ? { ...contact, isOnline: payload.isOnline, lastSeen: payload.lastSeen ?? null }
+          : contact
+      ));
+      break;
+    }
+    case 'chat:updated': {
+      const chat = state.chats.find((item) => item.id === String(payload.chatId));
+      if (!chat) {
+        break;
+      }
+      if (payload.lastMessagePreview !== undefined) {
+        chat.lastMessagePreview = payload.lastMessagePreview;
+      }
+      if (payload.lastMessageAt !== undefined) {
+        chat.lastMessageAt = payload.lastMessageAt;
+      }
+      if (Number.isFinite(Number(payload.unreadCount))) {
+        chat.unreadCount = Number(payload.unreadCount);
+      }
+      state.chats.sort((left, right) => new Date(right.lastMessageAt) - new Date(left.lastMessageAt));
+      break;
+    }
+    case 'message:new': {
+      const message = normalizeMessage(payload);
+      const chatId = message.chatId;
+      const current = state.messagesByChat[chatId] || [];
+      const existingIndex = current.findIndex((item) => (
+        item.id === message.id
+          || (message.clientMessageId && item.clientMessageId && item.clientMessageId === message.clientMessageId)
+      ));
+      if (existingIndex >= 0) {
+        current[existingIndex] = { ...current[existingIndex], ...message, deliveryState: 'sent' };
+        state.messagesByChat[chatId] = [...current];
+      } else {
+        state.messagesByChat[chatId] = [...current, message];
+      }
+      syncFilesHubFromMessage(message);
+      const chat = state.chats.find((item) => item.id === chatId);
+      if (chat) {
+        chat.lastMessagePreview = getMessagePreviewText(message);
+        chat.lastMessageAt = message.createdAt;
+        if (!message.mine && state.selectedChatId !== chatId) {
+          chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+        }
+      }
+
+      if (isRealtimeLeader() && !message.mine) {
+        emitSocketCommand('message:delivered', { messageId: message.id });
+        if (state.selectedChatId === chatId) {
+          emitSocketCommand('message:seen', { messageId: message.id });
+        }
+      }
+
+      await persistChatMessagesCache(chatId);
+      if (message.isEncrypted) {
+        resolveMessageForDisplay(message).then((decryptedMessage) => {
+          upsertMessageForChat(chatId, decryptedMessage);
+          recalculateChatFromMessages(chatId);
+          persistChatMessagesCache(chatId);
+          render();
+        });
+      }
+      break;
+    }
+    case 'message:updated': {
+      const message = normalizeMessage(payload);
+      state.messagesByChat[message.chatId] = (state.messagesByChat[message.chatId] || []).map((item) => (
+        item.id === message.id ? { ...item, ...message } : item
+      ));
+      syncFilesHubFromMessage(message);
+      await persistChatMessagesCache(message.chatId);
+      if (message.isEncrypted) {
+        resolveMessageForDisplay(message).then((decryptedMessage) => {
+          upsertMessageForChat(message.chatId, decryptedMessage);
+          recalculateChatFromMessages(message.chatId);
+          persistChatMessagesCache(message.chatId);
+          render();
+        });
+      }
+      break;
+    }
+    case 'message:deleted': {
+      state.messagesByChat[payload.chatId] = (state.messagesByChat[payload.chatId] || []).filter((item) => item.id !== String(payload.messageId));
+      state.filesHub.items = state.filesHub.items.filter((item) => item.messageId !== String(payload.messageId));
+      recalculateChatFromMessages(payload.chatId);
+      await persistChatMessagesCache(payload.chatId);
+      break;
+    }
+    case 'message:seen': {
+      state.messagesByChat[payload.chatId] = (state.messagesByChat[payload.chatId] || []).map((item) => (
+        item.id === String(payload.messageId)
+          ? { ...item, seenCount: Number(item.seenCount || 0) + 1 }
+          : item
+      ));
+      break;
+    }
+    case 'message:reactions': {
+      state.messagesByChat[payload.chatId] = (state.messagesByChat[payload.chatId] || []).map((item) => (
+        item.id === String(payload.messageId)
+          ? { ...item, reactions: normalizeReactions(payload.reactions) }
+          : item
+      ));
+      await persistChatMessagesCache(payload.chatId);
+      break;
+    }
+    case 'message:typing': {
+      state.typingByChat[payload.chatId] = `${payload.fullName || 'Someone'} is typing...`;
+      break;
+    }
+    case 'message:stop-typing': {
+      delete state.typingByChat[payload.chatId];
+      break;
+    }
+    case 'notification:new': {
+      const notification = normalizeNotification(payload);
+      const existed = state.notifications.some((item) => item.id === notification.id);
+      state.notifications = [notification, ...state.notifications.filter((item) => item.id !== notification.id)];
+      if (!existed && !notification.isRead) {
+        state.unreadNotificationCount += 1;
+      }
+      break;
+    }
+    case 'notification:read': {
+      if (payload.all) {
+        state.notifications = state.notifications.map((item) => ({ ...item, isRead: true }));
+      } else {
+        state.notifications = state.notifications.map((item) => (
+          item.id === String(payload.notificationId) ? { ...item, isRead: true } : item
+        ));
+      }
+      state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
+      break;
+    }
+    case 'notification:count': {
+      if (payload.unreadCount > state.unreadNotificationCount) {
+        pushToast('New activity', 'Your live notifications have been updated.', 'info');
+      }
+      state.unreadNotificationCount = payload.unreadCount;
+      break;
+    }
+    default:
+      return;
+  }
+
+  if (broadcast) {
+    broadcastSocketEvent(kind, payload);
+  }
+
+  render();
+}
+
+function setRealtimeFollower(leaderId = '') {
+  if (state.coordination.isLeader) {
+    disconnectSocket();
+    releaseOutboxOwnership();
+  }
+  updateLeaderState(leaderId, false);
+  render();
+}
+
+async function promoteRealtimeLeader() {
+  if (!canHoldRealtimeLeadership()) {
+    setRealtimeFollower('');
+    return;
+  }
+
+  const nextLock = {
+    tabId: TAB_ID,
+    updatedAt: nowMs(),
+  };
+  writeStorageJson(REALTIME_LEADER_LOCK_KEY, nextLock);
+  if (readLeaderLock()?.tabId !== TAB_ID) {
+    setRealtimeFollower(readLeaderLock()?.tabId || '');
+    return;
+  }
+
+  updateLeaderState(TAB_ID, true);
+  postRealtimeSignal('leader-heartbeat', { tabId: TAB_ID, updatedAt: nextLock.updatedAt });
+  connectLiveSocket();
+  if (state.screen === 'workspace' && !state.isLoading) {
+    reconcileRealtimeState({ refreshActiveChat: true }).catch(() => null);
+  }
+  render();
+}
+
+async function refreshLeadership() {
+  if (!canHoldRealtimeLeadership()) {
+    if (isRealtimeLeader()) {
+      releaseLeadership();
+    }
+    setRealtimeFollower('');
+    return;
+  }
+
+  const current = readLeaderLock();
+  if (isRealtimeLeader()) {
+    writeStorageJson(REALTIME_LEADER_LOCK_KEY, {
+      tabId: TAB_ID,
+      updatedAt: nowMs(),
+    });
+    postRealtimeSignal('leader-heartbeat', { tabId: TAB_ID, updatedAt: nowMs() });
+    return;
+  }
+
+  if (!isFreshLock(current, LEADER_STALE_MS) || current.tabId === TAB_ID) {
+    await promoteRealtimeLeader();
+    return;
+  }
+
+  updateLeaderState(current.tabId, false);
+}
+
+function releaseLeadership() {
+  const current = readLeaderLock();
+  if (current?.tabId === TAB_ID) {
+    removeStorageKey(REALTIME_LEADER_LOCK_KEY);
+    postRealtimeSignal('leader-release', { tabId: TAB_ID });
+  }
+  releaseOutboxOwnership();
+}
+
+function handleCoordinationMessage(message) {
+  if (!message || message.tabId === TAB_ID) {
+    return;
+  }
+
+  if (message.type === 'leader-heartbeat') {
+    if (!isRealtimeLeader()) {
+      updateLeaderState(message.payload?.tabId || message.tabId, false);
+      render();
+    }
+    return;
+  }
+
+  if (message.type === 'leader-release') {
+    if (!isRealtimeLeader() && state.coordination.leaderId === (message.payload?.tabId || message.tabId)) {
+      updateLeaderState('', false);
+      window.setTimeout(() => {
+        refreshLeadership().catch(() => null);
+      }, 50);
+      render();
+    }
+    return;
+  }
+
+  if (message.type === 'emit-socket' && isRealtimeLeader() && state.socket?.connected) {
+    state.socket.emit(message.payload?.kind, message.payload?.payload || {});
+    return;
+  }
+
+  if (message.type === 'socket-event') {
+    applyRealtimeEvent(message.payload?.kind, message.payload?.payload || {}, { broadcast: false }).catch(() => null);
+    return;
+  }
+
+  if (message.type === 'outbox-changed') {
+    refreshPendingOutboxCount().then(() => {
+      if (isRealtimeLeader() && state.offline.isOnline) {
+        flushPendingOutbox();
+      } else {
+        render();
+      }
+    }).catch(() => null);
+  }
+}
+
+function handleStorageEvent(event) {
+  if (event.key === REALTIME_SIGNAL_KEY && event.newValue) {
+    handleCoordinationMessage(readStorageJson(REALTIME_SIGNAL_KEY));
+    return;
+  }
+
+  if (event.key === REALTIME_LEADER_LOCK_KEY) {
+    const current = readLeaderLock();
+    if (current?.tabId && current.tabId !== TAB_ID) {
+      setRealtimeFollower(current.tabId);
+    } else if (!current && !isRealtimeLeader()) {
+      window.setTimeout(() => {
+        refreshLeadership().catch(() => null);
+      }, 50);
+    }
+    return;
+  }
+
+  if (event.key === SESSION_KEY) {
+    const session = readSession();
+    state.token = session?.token || null;
+    state.refreshToken = session?.refreshToken || null;
+    if (!state.token) {
+      disconnectSocket();
+      setRealtimeFollower('');
+    } else if (isRealtimeLeader()) {
+      connectLiveSocket();
+    }
+    render();
+    return;
+  }
+
+  if (event.key === THEME_KEY) {
+    state.theme = readTheme();
+    applyTheme();
+    render();
+  }
+}
+
+function initTabCoordination() {
+  if (typeof window.BroadcastChannel === 'function') {
+    coordinationChannel = new window.BroadcastChannel(REALTIME_CHANNEL_NAME);
+    coordinationChannel.onmessage = (event) => {
+      handleCoordinationMessage(event.data);
+    };
+  }
+
+  window.addEventListener('storage', handleStorageEvent);
+  window.addEventListener('beforeunload', releaseLeadership);
+  window.addEventListener('pagehide', releaseLeadership);
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      refreshLeadership().catch(() => null);
+    }
+  });
+
+  leadershipHeartbeatTimer = window.setInterval(() => {
+    refreshLeadership().catch(() => null);
+  }, LEADER_HEARTBEAT_MS);
+  refreshLeadership().catch(() => null);
 }
 
 function createInitialVoiceRecorderState() {
@@ -584,6 +1198,7 @@ async function decryptChatMessages(chatId) {
 async function init() {
   state.theme = readTheme();
   applyTheme();
+  initTabCoordination();
   await hydratePendingOutbox();
   const stored = readSession();
 
@@ -610,7 +1225,9 @@ function handleConnectivityChange() {
 
   if (state.offline.isOnline) {
     pushToast('Back online', 'Queued work will resume automatically.', 'success');
-    flushPendingOutbox();
+    if (isRealtimeLeader()) {
+      flushPendingOutbox();
+    }
   } else {
     pushToast('Offline mode', 'Recent chats stay available and new messages will queue locally.', 'info');
   }
@@ -772,6 +1389,7 @@ async function queueOutboundMessage(entry) {
   }
   await persistChatMessagesCache(persistedEntry.chatId);
   await persistWorkspaceCache();
+  postRealtimeSignal('outbox-changed', { pendingCount: state.offline.pendingCount });
   render();
 }
 
@@ -811,13 +1429,20 @@ async function hydratePendingOutbox() {
 }
 
 async function flushPendingOutbox() {
-  if (state.dataSource !== 'api' || !state.token || !state.offline.isOnline || state.offline.isSyncing) {
+  if (state.dataSource !== 'api' || !state.token || !state.offline.isOnline || state.offline.isSyncing || !isRealtimeLeader()) {
+    return;
+  }
+
+  if (!acquireOutboxOwnership()) {
+    await refreshPendingOutboxCount();
+    render();
     return;
   }
 
   const entries = (await dbGetAll('outbox')).sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt));
   if (!entries.length) {
     state.offline.pendingCount = 0;
+    releaseOutboxOwnership();
     render();
     return;
   }
@@ -827,6 +1452,9 @@ async function flushPendingOutbox() {
 
   for (const entry of entries) {
     try {
+      if (!isRealtimeLeader() || !renewOutboxOwnership()) {
+        break;
+      }
       await setOutboxEntryState(entry.id, 'sending');
       revokePendingMessagePreview(entry.chatId, entry.localId);
       upsertMessageForChat(entry.chatId, await buildLocalPendingMessageForDisplay({ ...entry, deliveryState: 'sending' }));
@@ -895,6 +1523,8 @@ async function flushPendingOutbox() {
   state.offline.pendingCount = (await dbGetAll('outbox')).length;
   state.offline.isSyncing = false;
   await persistWorkspaceCache();
+  releaseOutboxOwnership();
+  postRealtimeSignal('outbox-changed', { pendingCount: state.offline.pendingCount });
   render();
 }
 
@@ -913,8 +1543,11 @@ async function retryPendingMessage(localMessageId) {
 
   revokePendingMessagePreview(entry.chatId, entry.localId);
   upsertMessageForChat(entry.chatId, await buildLocalPendingMessageForDisplay({ ...entry, deliveryState: 'queued' }));
+  postRealtimeSignal('outbox-changed', {});
   render();
-  await flushPendingOutbox();
+  if (isRealtimeLeader()) {
+    await flushPendingOutbox();
+  }
 }
 
 function createDemoWorkspace() {
@@ -1321,20 +1954,16 @@ function disconnectSocket() {
 
   state.socket = null;
   state.connectedChatId = null;
+  joinedSocketRooms = new Set();
   state.liveConnectionState = 'idle';
 }
 
 function joinSelectedChatRoom(chatId = state.selectedChatId) {
-  if (!state.socket || !chatId || state.connectedChatId === chatId) {
+  if (!state.socket || !chatId) {
     return;
   }
-
-  if (state.connectedChatId) {
-    state.socket.emit('chat:leave', { chatId: state.connectedChatId });
-  }
-
   state.connectedChatId = chatId;
-  state.socket.emit('chat:join', { chatId });
+  syncSocketChatRooms();
 }
 
 function upsertChat(chatPatch) {
@@ -1350,7 +1979,7 @@ function upsertChat(chatPatch) {
 }
 
 function syncChatReceipts(chatId) {
-  if (!state.socket || !chatId || state.dataSource !== 'api') {
+  if (!chatId || state.dataSource !== 'api') {
     return;
   }
 
@@ -1360,9 +1989,9 @@ function syncChatReceipts(chatId) {
       continue;
     }
 
-    state.socket.emit('message:delivered', { messageId: message.id });
+    emitSocketCommand('message:delivered', { messageId: message.id });
     if (state.selectedChatId === chatId) {
-      state.socket.emit('message:seen', { messageId: message.id });
+      emitSocketCommand('message:seen', { messageId: message.id });
     }
   }
 }
@@ -1372,8 +2001,15 @@ function connectLiveSocket() {
     return;
   }
 
+  if (!isRealtimeLeader()) {
+    disconnectSocket();
+    state.liveConnectionState = 'standby';
+    render();
+    return;
+  }
+
   if (state.socket?.connected) {
-    joinSelectedChatRoom();
+    syncSocketChatRooms();
     return;
   }
 
@@ -1388,9 +2024,10 @@ function connectLiveSocket() {
   socket.on('connect', () => {
     state.liveConnectionState = 'connected';
     state.offline.isOnline = true;
-    joinSelectedChatRoom();
+    syncSocketChatRooms();
     syncChatReceipts(state.selectedChatId);
     flushPendingOutbox();
+    reconcileRealtimeState({ refreshActiveChat: false }).catch(() => null);
     render();
   });
 
@@ -1404,162 +2041,52 @@ function connectLiveSocket() {
     render();
   });
 
-  socket.on('presence:update', ({ userId, isOnline, lastSeen }) => {
-    state.contacts = state.contacts.map((contact) => (
-      String(contact.id) === String(userId)
-        ? { ...contact, isOnline, lastSeen: lastSeen ?? null }
-        : contact
-    ));
-    render();
+  socket.on('presence:update', (payload) => {
+    applyRealtimeEvent('presence:update', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('chat:updated', ({ chatId, lastMessagePreview, lastMessageAt, unreadCount }) => {
-    const chat = state.chats.find((item) => item.id === String(chatId));
-    if (!chat) {
-      return;
-    }
-
-    if (lastMessagePreview !== undefined) {
-      chat.lastMessagePreview = lastMessagePreview;
-    }
-    if (lastMessageAt !== undefined) {
-      chat.lastMessageAt = lastMessageAt;
-    }
-    if (Number.isFinite(Number(unreadCount))) {
-      chat.unreadCount = Number(unreadCount);
-    }
-    state.chats.sort((left, right) => new Date(right.lastMessageAt) - new Date(left.lastMessageAt));
-    render();
+  socket.on('chat:updated', (payload) => {
+    applyRealtimeEvent('chat:updated', payload, { broadcast: true }).catch(() => null);
   });
 
   socket.on('message:new', (payload) => {
-    const message = normalizeMessage(payload);
-    const chatId = message.chatId;
-    const current = state.messagesByChat[chatId] || [];
-    const existingIndex = current.findIndex((item) => (
-      item.id === message.id
-        || (message.clientMessageId && item.clientMessageId && item.clientMessageId === message.clientMessageId)
-    ));
-    if (existingIndex >= 0) {
-      current[existingIndex] = { ...current[existingIndex], ...message, deliveryState: 'sent' };
-      state.messagesByChat[chatId] = [...current];
-    } else {
-      state.messagesByChat[chatId] = [...current, message];
-    }
-    syncFilesHubFromMessage(message);
-
-    const chat = state.chats.find((item) => item.id === chatId);
-    if (chat) {
-      chat.lastMessagePreview = getMessagePreviewText(message);
-      chat.lastMessageAt = message.createdAt;
-      if (!message.mine && state.selectedChatId !== chatId) {
-        chat.unreadCount = Number(chat.unreadCount || 0) + 1;
-      }
-    }
-
-    if (!message.mine) {
-      state.socket.emit('message:delivered', { messageId: message.id });
-      if (state.selectedChatId === chatId) {
-        state.socket.emit('message:seen', { messageId: message.id });
-      }
-    }
-
-    persistChatMessagesCache(chatId);
-    render();
-
-    if (message.isEncrypted) {
-      resolveMessageForDisplay(message).then((decryptedMessage) => {
-        upsertMessageForChat(chatId, decryptedMessage);
-        recalculateChatFromMessages(chatId);
-        persistChatMessagesCache(chatId);
-        render();
-      });
-    }
+    applyRealtimeEvent('message:new', payload, { broadcast: true }).catch(() => null);
   });
 
   socket.on('message:updated', (payload) => {
-    const message = normalizeMessage(payload);
-    state.messagesByChat[message.chatId] = (state.messagesByChat[message.chatId] || []).map((item) => (
-      item.id === message.id ? { ...item, ...message } : item
-    ));
-    syncFilesHubFromMessage(message);
-    persistChatMessagesCache(message.chatId);
-    render();
-
-    if (message.isEncrypted) {
-      resolveMessageForDisplay(message).then((decryptedMessage) => {
-        upsertMessageForChat(message.chatId, decryptedMessage);
-        recalculateChatFromMessages(message.chatId);
-        persistChatMessagesCache(message.chatId);
-        render();
-      });
-    }
+    applyRealtimeEvent('message:updated', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('message:deleted', ({ chatId, messageId }) => {
-    state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).filter((item) => item.id !== String(messageId));
-    state.filesHub.items = state.filesHub.items.filter((item) => item.messageId !== String(messageId));
-    persistChatMessagesCache(chatId);
-    render();
+  socket.on('message:deleted', (payload) => {
+    applyRealtimeEvent('message:deleted', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('message:seen', ({ chatId, messageId }) => {
-    state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).map((item) => (
-      item.id === String(messageId)
-        ? { ...item, seenCount: Number(item.seenCount || 0) + 1 }
-        : item
-    ));
-    render();
+  socket.on('message:seen', (payload) => {
+    applyRealtimeEvent('message:seen', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('message:reactions', ({ chatId, messageId, reactions }) => {
-    state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).map((item) => (
-      item.id === String(messageId)
-        ? { ...item, reactions: normalizeReactions(reactions) }
-        : item
-    ));
-    persistChatMessagesCache(chatId);
-    render();
+  socket.on('message:reactions', (payload) => {
+    applyRealtimeEvent('message:reactions', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('message:typing', ({ chatId, fullName }) => {
-    state.typingByChat[chatId] = `${fullName || 'Someone'} is typing...`;
-    render();
+  socket.on('message:typing', (payload) => {
+    applyRealtimeEvent('message:typing', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('message:stop-typing', ({ chatId }) => {
-    delete state.typingByChat[chatId];
-    render();
+  socket.on('message:stop-typing', (payload) => {
+    applyRealtimeEvent('message:stop-typing', payload, { broadcast: true }).catch(() => null);
   });
 
   socket.on('notification:new', (payload) => {
-    const notification = normalizeNotification(payload);
-    const existed = state.notifications.some((item) => item.id === notification.id);
-    state.notifications = [notification, ...state.notifications.filter((item) => item.id !== notification.id)];
-    if (!existed && !notification.isRead) {
-      state.unreadNotificationCount += 1;
-    }
-    render();
+    applyRealtimeEvent('notification:new', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('notification:read', ({ notificationId, all }) => {
-    if (all) {
-      state.notifications = state.notifications.map((item) => ({ ...item, isRead: true }));
-    } else {
-      state.notifications = state.notifications.map((item) => (
-        item.id === String(notificationId) ? { ...item, isRead: true } : item
-      ));
-    }
-    state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
-    render();
+  socket.on('notification:read', (payload) => {
+    applyRealtimeEvent('notification:read', payload, { broadcast: true }).catch(() => null);
   });
 
-  socket.on('notification:count', ({ unreadCount }) => {
-    if (unreadCount > state.unreadNotificationCount) {
-      pushToast('New activity', 'Your live notifications have been updated.', 'info');
-    }
-    state.unreadNotificationCount = unreadCount;
-    render();
+  socket.on('notification:count', (payload) => {
+    applyRealtimeEvent('notification:count', payload, { broadcast: true }).catch(() => null);
   });
 
   state.socket = socket;
@@ -1663,6 +2190,7 @@ async function loadLiveWorkspace() {
     state.offline.isOnline = window.navigator?.onLine ?? true;
     await persistWorkspaceCache();
 
+    await refreshLeadership();
     connectLiveSocket();
 
     const failedSections = [
@@ -2181,6 +2709,9 @@ async function apiFetch(path, options = {}, retry = { attemptedRefresh: false })
       clearSession();
       state.token = null;
       state.refreshToken = null;
+      disconnectSocket();
+      releaseLeadership();
+      setRealtimeFollower('');
     }
   }
 
@@ -4343,6 +4874,8 @@ async function handleClick(event) {
 
   if (action === 'logout') {
     disconnectSocket();
+    releaseLeadership();
+    setRealtimeFollower('');
     teardownVoiceLifecycle({ silent: true });
     revokeAllTrackedObjectUrls();
     clearSession();
@@ -4633,18 +5166,22 @@ let typingTimer = null;
 function handleInput(event) {
   const target = event.target;
 
-  if (target.id !== 'message-text' || !state.socket || !state.selectedChatId || state.dataSource !== 'api') {
+  if (target.id !== 'message-text' || !state.selectedChatId || state.dataSource !== 'api') {
     return;
   }
 
-  state.socket.emit('message:typing', { chatId: state.selectedChatId });
+  if (!typingEmitAt || (nowMs() - typingEmitAt) > 900) {
+    emitSocketCommand('message:typing', { chatId: state.selectedChatId });
+    typingEmitAt = nowMs();
+  }
 
   if (typingTimer) {
     window.clearTimeout(typingTimer);
   }
 
   typingTimer = window.setTimeout(() => {
-    state.socket?.emit('message:stop-typing', { chatId: state.selectedChatId });
+    emitSocketCommand('message:stop-typing', { chatId: state.selectedChatId });
+    typingEmitAt = 0;
   }, 1200);
 }
 
@@ -4938,7 +5475,8 @@ async function handleMessageSubmit(formData, form) {
   }
 
   try {
-    state.socket?.emit('message:stop-typing', { chatId });
+    emitSocketCommand('message:stop-typing', { chatId });
+    typingEmitAt = 0;
     const response = await apiFetch('/api/v1/messages', {
       method: 'POST',
       headers: {},
