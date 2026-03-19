@@ -1,5 +1,6 @@
 const messageService = require('../modules/messages/message.service');
 const { ensureChatMember } = require('../modules/chats/chat.service');
+const { canEmitTyping } = require('./presence.socket');
 
 async function joinChatRoom(socket, chatId) {
   const chat = await ensureChatMember(chatId, socket.user._id);
@@ -66,6 +67,9 @@ function registerChatSocket(io, socket) {
 
   socket.on('message:typing', ({ chatId } = {}) => safeSocketHandler(socket, async () => {
     await ensureChatMember(chatId, socket.user._id);
+    if (!(await canEmitTyping(socket.user._id))) {
+      return;
+    }
     socket.to(`chat:${chatId}`).emit('message:typing', {
       chatId,
       userId: socket.user._id,

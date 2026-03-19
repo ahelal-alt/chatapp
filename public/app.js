@@ -1,5 +1,6 @@
 const appRoot = document.getElementById('app');
 const SESSION_KEY = 'pulsechat-session';
+const THEME_KEY = 'pulsechat-theme';
 
 const demoWorkspace = createDemoWorkspace();
 
@@ -24,6 +25,7 @@ const state = {
   requests: { incoming: [], outgoing: [] },
   groups: [],
   notifications: [],
+  unreadNotificationCount: 0,
   admin: {
     summary: null,
   },
@@ -31,6 +33,8 @@ const state = {
   toasts: [],
   socket: null,
   connectedChatId: null,
+  theme: 'dark',
+  liveConnectionState: 'idle',
 };
 
 init();
@@ -40,6 +44,8 @@ appRoot.addEventListener('submit', handleSubmit);
 appRoot.addEventListener('input', handleInput);
 
 async function init() {
+  state.theme = readTheme();
+  applyTheme();
   const stored = readSession();
 
   if (stored?.token) {
@@ -411,6 +417,14 @@ function clearSession() {
   window.localStorage.removeItem(SESSION_KEY);
 }
 
+function readTheme() {
+  return window.localStorage.getItem(THEME_KEY) || 'dark';
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = state.theme;
+}
+
 function disconnectSocket() {
   if (state.socket) {
     state.socket.disconnect();
@@ -420,8 +434,8 @@ function disconnectSocket() {
   state.connectedChatId = null;
 }
 
-function joinSelectedChatRoom() {
-  if (!state.socket || !state.selectedChatId || state.connectedChatId === state.selectedChatId) {
+function joinSelectedChatRoom(chatId = state.selectedChatId) {
+  if (!state.socket || !chatId || state.connectedChatId === chatId) {
     return;
   }
 
@@ -429,8 +443,8 @@ function joinSelectedChatRoom() {
     state.socket.emit('chat:leave', { chatId: state.connectedChatId });
   }
 
-  state.connectedChatId = state.selectedChatId;
-  state.socket.emit('chat:join', { chatId: state.selectedChatId });
+  state.connectedChatId = chatId;
+  state.socket.emit('chat:join', { chatId });
 }
 
 function upsertChat(chatPatch) {
@@ -443,6 +457,24 @@ function upsertChat(chatPatch) {
 
   state.chats.unshift(chatPatch);
   return chatPatch;
+}
+
+function syncChatReceipts(chatId) {
+  if (!state.socket || !chatId || state.dataSource !== 'api') {
+    return;
+  }
+
+  const messages = state.messagesByChat[chatId] || [];
+  for (const message of messages) {
+    if (message.mine) {
+      continue;
+    }
+
+    state.socket.emit('message:delivered', { messageId: message.id });
+    if (state.selectedChatId === chatId) {
+      state.socket.emit('message:seen', { messageId: message.id });
+    }
+  }
 }
 
 function connectLiveSocket() {
@@ -464,7 +496,14 @@ function connectLiveSocket() {
   });
 
   socket.on('connect', () => {
+    state.liveConnectionState = 'connected';
     joinSelectedChatRoom();
+    render();
+  });
+
+  socket.on('disconnect', () => {
+    state.liveConnectionState = 'disconnected';
+    render();
   });
 
   socket.on('presence:update', ({ userId, isOnline, lastSeen }) => {
@@ -476,7 +515,7 @@ function connectLiveSocket() {
     render();
   });
 
-  socket.on('chat:updated', ({ chatId, lastMessagePreview, lastMessageAt }) => {
+  socket.on('chat:updated', ({ chatId, lastMessagePreview, lastMessageAt, unreadCount }) => {
     const chat = state.chats.find((item) => item.id === String(chatId));
     if (!chat) {
       return;
@@ -484,6 +523,9 @@ function connectLiveSocket() {
 
     chat.lastMessagePreview = lastMessagePreview || chat.lastMessagePreview;
     chat.lastMessageAt = lastMessageAt || chat.lastMessageAt;
+    if (Number.isFinite(Number(unreadCount))) {
+      chat.unreadCount = Number(unreadCount);
+    }
     state.chats.sort((left, right) => new Date(right.lastMessageAt) - new Date(left.lastMessageAt));
     render();
   });
@@ -502,6 +544,13 @@ function connectLiveSocket() {
       chat.lastMessageAt = message.createdAt;
       if (!message.mine && state.selectedChatId !== chatId) {
         chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+      }
+    }
+
+    if (!message.mine) {
+      state.socket.emit('message:delivered', { messageId: message.id });
+      if (state.selectedChatId === chatId) {
+        state.socket.emit('message:seen', { messageId: message.id });
       }
     }
 
@@ -543,34 +592,39 @@ function connectLiveSocket() {
   socket.on('notification:new', (payload) => {
     const notification = normalizeNotification(payload);
     state.notifications = [notification, ...state.notifications.filter((item) => item.id !== notification.id)];
+    state.unreadNotificationCount += notification.isRead ? 0 : 1;
     render();
   });
 
   socket.on('notification:read', ({ notificationId, all }) => {
     if (all) {
       state.notifications = state.notifications.map((item) => ({ ...item, isRead: true }));
+      state.unreadNotificationCount = 0;
     } else {
       state.notifications = state.notifications.map((item) => (
         item.id === String(notificationId) ? { ...item, isRead: true } : item
       ));
+      state.unreadNotificationCount = Math.max(0, state.unreadNotificationCount - 1);
     }
     render();
   });
 
   socket.on('notification:count', ({ unreadCount }) => {
-    const currentUnread = state.notifications.filter((item) => !item.isRead).length;
-    if (unreadCount > currentUnread) {
+    if (unreadCount > state.unreadNotificationCount) {
       pushToast('New activity', 'Your live notifications have been updated.', 'info');
     }
+    state.unreadNotificationCount = unreadCount;
     render();
   });
 
   state.socket = socket;
+  state.liveConnectionState = 'connecting';
 }
 
 function syncDemoState() {
   disconnectSocket();
   state.dataSource = 'demo';
+  state.liveConnectionState = 'idle';
   state.user = structuredClone(demoWorkspace.user);
   state.privacy = structuredClone(demoWorkspace.privacy);
   state.chats = structuredClone(demoWorkspace.chats);
@@ -578,6 +632,7 @@ function syncDemoState() {
   state.requests = structuredClone(demoWorkspace.requests);
   state.groups = structuredClone(demoWorkspace.groups);
   state.notifications = structuredClone(demoWorkspace.notifications);
+  state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
   state.messagesByChat = structuredClone(demoWorkspace.messagesByChat);
   state.admin.summary = null;
   state.typingByChat = {};
@@ -632,6 +687,7 @@ async function loadLiveWorkspace() {
     state.notifications = notificationsRes.status === 'fulfilled'
       ? (notificationsRes.value.data || []).map(normalizeNotification)
       : [];
+    state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
     state.admin.summary = adminRes.status === 'fulfilled' ? adminRes.value.data || null : null;
     state.groups = buildGroupsFromChats(state.chats);
     state.messagesByChat = {};
@@ -849,7 +905,8 @@ async function loadChatMessages(chatId) {
     if (chat) {
       chat.unreadCount = 0;
     }
-    joinSelectedChatRoom();
+    joinSelectedChatRoom(chatId);
+    syncChatReceipts(chatId);
   } catch (error) {
     pushToast('Messages unavailable', error.message, 'info');
     state.messagesByChat[chatId] = [];
@@ -1042,7 +1099,7 @@ function renderAuthForm() {
 }
 
 function renderWorkspace() {
-  const unreadCount = state.notifications.filter((item) => !item.isRead).length;
+  const unreadCount = state.unreadNotificationCount;
   const pendingCount = state.requests.incoming.length + state.requests.outgoing.length;
   const selectedChat = getSelectedChat();
 
@@ -1060,8 +1117,12 @@ function renderWorkspace() {
           <div class="status-pill ${state.dataSource === 'api' ? '' : 'warning'}">
             <span>${state.dataSource === 'api' ? 'Using backend data' : 'Using seeded preview data'}</span>
           </div>
+          ${state.dataSource === 'api'
+            ? `<div class="status-pill neutral"><span>${state.liveConnectionState === 'connected' ? 'Realtime connected' : state.liveConnectionState === 'connecting' ? 'Connecting realtime' : 'Realtime paused'}</span></div>`
+            : ''}
         </div>
         <div class="topbar-right">
+          <button class="ghost-button" type="button" data-action="toggle-theme">${state.theme === 'dark' ? 'Light mode' : 'Dark mode'}</button>
           <a class="ghost-button" href="/api/docs" target="_blank" rel="noreferrer">API docs</a>
           <button class="ghost-button" type="button" data-action="logout">Log out</button>
         </div>

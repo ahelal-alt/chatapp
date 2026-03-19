@@ -18,10 +18,30 @@ const storage = multer.diskStorage({
   },
 });
 
-const allowedMimeTypes = [
+function createUpload(allowedMimeTypes) {
+  return multer({
+    storage,
+    limits: {
+      fileSize: env.maxFileSizeMb * 1024 * 1024,
+    },
+    fileFilter: (req, file, cb) => {
+      if (!allowedMimeTypes.includes(file.mimetype)) {
+        return cb(new ApiError(400, 'Unsupported file type'));
+      }
+
+      return cb(null, true);
+    },
+  });
+}
+
+const imageMimeTypes = [
   'image/jpeg',
   'image/png',
   'image/webp',
+];
+
+const chatMediaMimeTypes = [
+  ...imageMimeTypes,
   'video/mp4',
   'audio/mpeg',
   'audio/mp4',
@@ -30,19 +50,7 @@ const allowedMimeTypes = [
   'application/zip',
 ];
 
-const upload = multer({
-  storage,
-  limits: {
-    fileSize: env.maxFileSizeMb * 1024 * 1024,
-  },
-  fileFilter: (req, file, cb) => {
-    if (!allowedMimeTypes.includes(file.mimetype)) {
-      return cb(new ApiError(400, 'Unsupported file type'));
-    }
-
-    return cb(null, true);
-  },
-});
-
-module.exports = upload;
-
+module.exports = {
+  uploadProfileImage: createUpload(imageMimeTypes),
+  uploadChatMedia: createUpload(chatMediaMimeTypes),
+};
