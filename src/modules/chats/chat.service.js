@@ -56,11 +56,15 @@ async function emitChatUpdated(chat) {
   }
 
   for (const memberId of chat.memberIds) {
+    const participantSetting = ensureParticipantSetting(chat, memberId);
+    const unreadCount = await getUnreadCount(chat._id, memberId, participantSetting.clearedAt);
+
     io.to(`user:${memberId}`).emit('chat:updated', {
       chatId: chat._id,
       lastMessageId: chat.lastMessageId,
       lastMessagePreview: chat.lastMessagePreview,
       lastMessageAt: chat.lastMessageAt,
+      unreadCount,
     });
   }
 }
@@ -130,7 +134,7 @@ async function getUnreadCount(chatId, userId, clearedAt) {
     senderId: { $ne: userId },
     deletedForEveryone: false,
     deletedForUsers: { $ne: userId },
-    'seenBy.userId': { $ne: userId },
+    readByUserIds: { $ne: userId },
   };
 
   if (clearedAt) {

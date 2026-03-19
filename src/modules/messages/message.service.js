@@ -7,6 +7,7 @@ const notificationService = require('../notifications/notification.service');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const { escapeRegex } = require('../../utils/validation');
 const { getIO } = require('../../sockets/state');
+const { getMessagingPrivacySettings } = require('../../utils/privacy');
 const {
   ensureChatMember,
   ensurePrivateMessagingAllowed,
@@ -96,6 +97,7 @@ async function createMessage(senderId, payload) {
     replyToMessageId: payload.replyToMessageId || null,
     forwardedFromMessageId: payload.forwardedFromMessageId || null,
     deliveredTo: [],
+    readByUserIds: [senderId],
   });
 
   chat.lastMessageId = message._id;
@@ -453,18 +455,27 @@ async function markDelivered(userId, messageId) {
 
 async function markSeen(userId, messageId) {
   const message = await getMessageById(userId, messageId);
+  const { readReceiptsEnabled } = await getMessagingPrivacySettings(userId);
+  const alreadyRead = message.readByUserIds.some((id) => String(id) === String(userId));
   const alreadySeen = message.seenBy.some((item) => String(item.userId) === String(userId));
 
-  if (!alreadySeen) {
+  if (!alreadyRead) {
+    message.readByUserIds.push(userId);
+  }
+
+  if (readReceiptsEnabled && !alreadySeen) {
     message.seenBy.push({
       userId,
       seenAt: new Date(),
     });
+  }
+
+  if (!alreadyRead || (readReceiptsEnabled && !alreadySeen)) {
     await message.save();
   }
 
   const io = getIO();
-  if (io) {
+  if (io && readReceiptsEnabled) {
     io.to(`chat:${message.chatId}`).emit('message:seen', {
       chatId: message.chatId,
       messageId: message._id,

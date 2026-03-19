@@ -1,16 +1,16 @@
 const User = require('../modules/users/user.model');
-const { getUserSocketCount } = require('./state');
+const { buildPresencePayloadForViewer, getMessagingPrivacySettings } = require('../utils/privacy');
+const { getConnectedUserIds, getUserSocketCount } = require('./state');
 
-function buildPresencePayload(userId, isOnline, lastSeen = null) {
-  return {
-    userId,
-    isOnline,
-    lastSeen,
-  };
-}
+async function emitPresence(io, userId, isOnline, lastSeen = null) {
+  const connectedUserIds = getConnectedUserIds();
 
-function emitPresence(io, userId, isOnline, lastSeen = null) {
-  io.emit('presence:update', buildPresencePayload(userId, isOnline, lastSeen));
+  await Promise.all(
+    connectedUserIds.map(async (viewerId) => {
+      const payload = await buildPresencePayloadForViewer(viewerId, userId, isOnline, lastSeen);
+      io.to(`user:${viewerId}`).emit('presence:update', payload);
+    }),
+  );
 }
 
 async function setPresence(io, userId, isOnline) {
@@ -21,7 +21,12 @@ async function setPresence(io, userId, isOnline) {
     lastSeen,
   });
 
-  emitPresence(io, userId, isOnline, lastSeen);
+  await emitPresence(io, userId, isOnline, lastSeen);
+}
+
+async function canEmitTyping(userId) {
+  const settings = await getMessagingPrivacySettings(userId);
+  return settings.typingIndicatorEnabled;
 }
 
 function registerPresenceSocket(io, socket) {
@@ -39,8 +44,8 @@ function registerPresenceSocket(io, socket) {
 }
 
 module.exports = {
-  buildPresencePayload,
   emitPresence,
   setPresence,
+  canEmitTyping,
   registerPresenceSocket,
 };

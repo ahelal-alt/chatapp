@@ -2,7 +2,7 @@ const Contact = require('../modules/contacts/contact.model');
 const PrivacySettings = require('../modules/privacy/privacy.model');
 const User = require('../modules/users/user.model');
 const ApiError = require('./ApiError');
-const { assertNotBlocked } = require('./blockCheck');
+const { assertNotBlocked, isBlocked } = require('./blockCheck');
 
 async function ensureActiveUser(userId, message = 'User not found') {
   const user = await User.findById(userId);
@@ -25,6 +25,73 @@ async function areContacts(userId, otherUserId) {
 
 async function getPrivacySettings(userId) {
   return PrivacySettings.findOne({ userId }).lean();
+}
+
+function canAccessVisibility(privacyValue, isSelf, isContact) {
+  if (isSelf) {
+    return true;
+  }
+
+  if (privacyValue === 'everyone') {
+    return true;
+  }
+
+  if (privacyValue === 'contacts') {
+    return isContact;
+  }
+
+  return false;
+}
+
+async function buildViewerPrivacyContext(viewerId, targetUserId) {
+  const isSelf = String(viewerId) === String(targetUserId);
+  const [privacy, contact, blocked] = await Promise.all([
+    getPrivacySettings(targetUserId),
+    isSelf ? Promise.resolve(true) : areContacts(viewerId, targetUserId),
+    isSelf ? Promise.resolve(false) : isBlocked(viewerId, targetUserId),
+  ]);
+
+  return {
+    isSelf,
+    isContact: Boolean(contact),
+    blocked,
+    privacy: privacy || {},
+  };
+}
+
+async function buildPresencePayloadForViewer(viewerId, targetUserId, isOnline, lastSeen = null) {
+  const context = await buildViewerPrivacyContext(viewerId, targetUserId);
+
+  if (context.blocked && !context.isSelf) {
+    return {
+      userId: targetUserId,
+      isOnline: false,
+      lastSeen: null,
+    };
+  }
+
+  return {
+    userId: targetUserId,
+    isOnline: canAccessVisibility(
+      context.privacy.onlineStatusVisibility || 'contacts',
+      context.isSelf,
+      context.isContact,
+    ) ? isOnline : false,
+    lastSeen: canAccessVisibility(
+      context.privacy.lastSeenVisibility || 'contacts',
+      context.isSelf,
+      context.isContact,
+    ) ? lastSeen : null,
+  };
+}
+
+async function getMessagingPrivacySettings(userId) {
+  const privacy = await getPrivacySettings(userId);
+
+  return {
+    readReceiptsEnabled: privacy?.readReceiptsEnabled ?? true,
+    typingIndicatorEnabled: privacy?.typingIndicatorEnabled ?? true,
+  };
 }
 
 async function ensurePrivateMessagingAllowed(requesterId, targetUserId) {
@@ -81,6 +148,10 @@ module.exports = {
   ensureActiveUser,
   areContacts,
   getPrivacySettings,
+  canAccessVisibility,
+  buildViewerPrivacyContext,
+  buildPresencePayloadForViewer,
+  getMessagingPrivacySettings,
   ensurePrivateMessagingAllowed,
   ensureGroupInviteAllowed,
   ensureGroupInvitesAllowed,

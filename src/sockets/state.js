@@ -40,10 +40,15 @@ function getUserSocketCount(userId) {
   return activeSocketsByUser.get(String(userId))?.size || 0;
 }
 
+function getConnectedUserIds() {
+  return [...activeSocketsByUser.keys()];
+}
+
 module.exports = {
   setIO,
   getIO,
   addUserSocket,
   removeUserSocket,
   getUserSocketCount,
+  getConnectedUserIds,
 };

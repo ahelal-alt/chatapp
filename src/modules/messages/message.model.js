@@ -86,6 +86,12 @@ const messageSchema = new mongoose.Schema(
         ref: 'User',
       },
     ],
+    readByUserIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+    ],
     seenBy: {
       type: [seenBySchema],
       default: [],
