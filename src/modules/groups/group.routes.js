@@ -10,15 +10,15 @@ router.use(authenticate);
 
 router.post('/', validation.createGroupValidation, validateRequest, controller.createGroup);
 router.get('/:groupId', validation.groupIdValidation, validateRequest, controller.getGroup);
-router.put('/:groupId', validation.groupIdValidation, validateRequest, controller.updateGroup);
+router.put('/:groupId', validation.updateGroupValidation, validateRequest, controller.updateGroup);
 router.delete('/:groupId', validation.groupIdValidation, validateRequest, controller.deleteGroup);
 router.post('/:groupId/members', validation.addMembersValidation, validateRequest, controller.addMembers);
 router.delete('/:groupId/members/:userId', validation.memberActionValidation, validateRequest, controller.removeMember);
 router.put('/:groupId/members/:userId/promote', validation.memberActionValidation, validateRequest, controller.promoteMember);
 router.put('/:groupId/members/:userId/demote', validation.memberActionValidation, validateRequest, controller.demoteMember);
+router.put('/:groupId/members/:userId/transfer-ownership', validation.transferOwnershipValidation, validateRequest, controller.transferOwnership);
 router.post('/:groupId/leave', validation.groupIdValidation, validateRequest, controller.leaveGroup);
 router.post('/:groupId/invite-code', validation.groupIdValidation, validateRequest, controller.generateInviteCode);
 router.post('/join/:inviteCode', validation.inviteCodeValidation, validateRequest, controller.joinByInviteCode);
 
 module.exports = router;
-

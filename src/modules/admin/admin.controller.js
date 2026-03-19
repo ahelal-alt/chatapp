@@ -2,6 +2,11 @@ const ApiResponse = require('../../utils/ApiResponse');
 const asyncHandler = require('../../utils/asyncHandler');
 const service = require('./admin.service');
 
+const getDashboardSummary = asyncHandler(async (req, res) => {
+  const summary = await service.getDashboardSummary();
+  res.json(new ApiResponse('Admin dashboard fetched successfully', summary));
+});
+
 const listUsers = asyncHandler(async (req, res) => {
   const result = await service.listUsers(req.query);
   res.json(new ApiResponse('Users fetched successfully', result.items, result.meta));
@@ -28,10 +33,10 @@ const deleteMessage = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  getDashboardSummary,
   listUsers,
   listReports,
   suspendUser,
   activateUser,
   deleteMessage,
 };
-

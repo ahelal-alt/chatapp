@@ -1,4 +1,3 @@
-const Chat = require('../chats/chat.model');
 const Message = require('./message.model');
 const Reaction = require('./reaction.model');
 const Group = require('../groups/group.model');
@@ -6,20 +5,15 @@ const GroupMember = require('../groups/groupMember.model');
 const ApiError = require('../../utils/ApiError');
 const notificationService = require('../notifications/notification.service');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
+const { escapeRegex } = require('../../utils/validation');
 const { getIO } = require('../../sockets/state');
-const { ensureChatMember, ensurePrivateMessagingAllowed } = require('../chats/chat.service');
-
-function buildPreview(payload) {
-  if (payload.type === 'location') {
-    return 'Location';
-  }
-
-  if (payload.text?.trim()) {
-    return payload.text.slice(0, 120);
-  }
-
-  return payload.type || 'Message';
-}
+const {
+  ensureChatMember,
+  ensurePrivateMessagingAllowed,
+  buildChatPreview,
+  emitChatUpdated,
+  refreshChatSummary,
+} = require('../chats/chat.service');
 
 function hasMessagePayload(payload) {
   return Boolean(
@@ -33,7 +27,7 @@ async function assertCanSendToChat(chat, senderId) {
   if (chat.type === 'private') {
     const recipientId = chat.memberIds.find((memberId) => String(memberId) !== String(senderId));
     await ensurePrivateMessagingAllowed(senderId, recipientId);
-    return;
+    return null;
   }
 
   const group = await Group.findOne({ chatId: chat._id });
@@ -49,12 +43,31 @@ async function assertCanSendToChat(chat, senderId) {
   if (group.onlyAdminsCanMessage && !['owner', 'admin'].includes(membership.role)) {
     throw new ApiError(403, 'Only admins can send messages in this group');
   }
+
+  return { group, membership };
+}
+
+async function assertCanPinInChat(chat, userId) {
+  if (chat.type === 'private') {
+    return;
+  }
+
+  const group = await Group.findOne({ chatId: chat._id });
+  if (!group) {
+    throw new ApiError(404, 'Group details not found');
+  }
+
+  const membership = await GroupMember.findOne({ groupId: group._id, userId });
+  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+    throw new ApiError(403, 'Only group admins can pin messages');
+  }
 }
 
 async function populateMessage(messageId) {
   return Message.findById(messageId)
     .populate('senderId', 'fullName username profileImage')
     .populate('replyToMessageId')
+    .populate('pinnedBy', 'fullName username')
     .lean();
 }
 
@@ -86,54 +99,32 @@ async function createMessage(senderId, payload) {
   });
 
   chat.lastMessageId = message._id;
-  chat.lastMessagePreview = buildPreview(payload);
+  chat.lastMessagePreview = buildChatPreview(message);
   chat.lastMessageAt = message.createdAt;
   await chat.save();
 
   const io = getIO();
   const hydrated = await populateMessage(message._id);
 
-  if (chat.type === 'private') {
-    for (const recipientId of recipientIds) {
-      await notificationService.createNotification({
-        userId: recipientId,
-        type: 'private_message',
-        title: 'New message',
-        body: buildPreview(payload),
-        data: {
-          chatId: chat._id,
-          messageId: message._id,
-          senderId,
-        },
-      });
-    }
-  } else {
-    for (const recipientId of recipientIds) {
-      await notificationService.createNotification({
-        userId: recipientId,
-        type: 'group_message',
-        title: 'New group message',
-        body: buildPreview(payload),
-        data: {
-          chatId: chat._id,
-          messageId: message._id,
-          senderId,
-        },
-      });
-    }
+  for (const recipientId of recipientIds) {
+    await notificationService.createNotification({
+      userId: recipientId,
+      type: chat.type === 'private' ? 'private_message' : 'group_message',
+      title: chat.type === 'private' ? 'New message' : 'New group message',
+      body: buildChatPreview(message),
+      data: {
+        chatId: chat._id,
+        messageId: message._id,
+        senderId,
+      },
+    });
   }
 
   if (io) {
     io.to(`chat:${chat._id}`).emit('message:new', hydrated);
-    for (const memberId of chat.memberIds) {
-      io.to(`user:${memberId}`).emit('chat:updated', {
-        chatId: chat._id,
-        lastMessageId: message._id,
-        lastMessagePreview: chat.lastMessagePreview,
-        lastMessageAt: chat.lastMessageAt,
-      });
-    }
   }
+
+  await emitChatUpdated(chat);
 
   return hydrated;
 }
@@ -161,7 +152,71 @@ async function listMessages(userId, chatId, query) {
       .skip(skip)
       .limit(limit)
       .populate('senderId', 'fullName username profileImage')
-      .populate('replyToMessageId'),
+      .populate('replyToMessageId')
+      .populate('pinnedBy', 'fullName username'),
+    Message.countDocuments(criteria),
+  ]);
+
+  return {
+    items,
+    meta: buildPaginationMeta({ page, limit, total }),
+  };
+}
+
+async function searchMessages(userId, chatId, query) {
+  const chat = await ensureChatMember(chatId, userId);
+  const { page, limit, skip } = getPagination(query);
+  const participantSettings = chat.participantSettings.find(
+    (item) => String(item.userId) === String(userId),
+  );
+  const pattern = escapeRegex(String(query.q || '').trim());
+
+  const criteria = {
+    chatId,
+    deletedForEveryone: false,
+    deletedForUsers: { $ne: userId },
+    text: { $regex: pattern, $options: 'i' },
+  };
+
+  if (participantSettings?.clearedAt) {
+    criteria.createdAt = { $gt: participantSettings.clearedAt };
+  }
+
+  const [items, total] = await Promise.all([
+    Message.find(criteria)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('senderId', 'fullName username profileImage')
+      .populate('replyToMessageId')
+      .populate('pinnedBy', 'fullName username'),
+    Message.countDocuments(criteria),
+  ]);
+
+  return {
+    items,
+    meta: buildPaginationMeta({ page, limit, total }),
+  };
+}
+
+async function listPinnedMessages(userId, chatId, query) {
+  await ensureChatMember(chatId, userId);
+  const { page, limit, skip } = getPagination(query);
+  const criteria = {
+    chatId,
+    deletedForEveryone: false,
+    deletedForUsers: { $ne: userId },
+    pinnedAt: { $ne: null },
+  };
+
+  const [items, total] = await Promise.all([
+    Message.find(criteria)
+      .sort({ pinnedAt: -1, createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('senderId', 'fullName username profileImage')
+      .populate('replyToMessageId')
+      .populate('pinnedBy', 'fullName username'),
     Message.countDocuments(criteria),
   ]);
 
@@ -174,7 +229,8 @@ async function listMessages(userId, chatId, query) {
 async function getMessageById(userId, messageId) {
   const message = await Message.findById(messageId)
     .populate('senderId', 'fullName username profileImage')
-    .populate('replyToMessageId');
+    .populate('replyToMessageId')
+    .populate('pinnedBy', 'fullName username');
 
   if (!message) {
     throw new ApiError(404, 'Message not found');
@@ -198,6 +254,10 @@ async function editMessage(userId, messageId, text) {
 
   await ensureChatMember(message.chatId, userId);
 
+  if (message.deletedForEveryone || message.deletedForUsers.some((id) => String(id) === String(userId))) {
+    throw new ApiError(404, 'Message not found');
+  }
+
   if (String(message.senderId) !== String(userId)) {
     throw new ApiError(403, 'You can only edit your own messages');
   }
@@ -208,10 +268,60 @@ async function editMessage(userId, messageId, text) {
 
   const io = getIO();
   if (io) {
-    io.to(`chat:${message.chatId}`).emit('message:updated', message);
+    io.to(`chat:${message.chatId}`).emit('message:updated', await populateMessage(message._id));
   }
 
-  return message;
+  await refreshChatSummary(message.chatId);
+  return populateMessage(message._id);
+}
+
+async function pinMessage(userId, messageId) {
+  const message = await Message.findById(messageId);
+
+  if (!message || message.deletedForEveryone) {
+    throw new ApiError(404, 'Message not found');
+  }
+
+  const chat = await ensureChatMember(message.chatId, userId);
+  await assertCanPinInChat(chat, userId);
+
+  message.pinnedAt = new Date();
+  message.pinnedBy = userId;
+  await message.save();
+
+  const hydrated = await populateMessage(message._id);
+  const io = getIO();
+  if (io) {
+    io.to(`chat:${message.chatId}`).emit('message:pinned', hydrated);
+  }
+
+  return hydrated;
+}
+
+async function unpinMessage(userId, messageId) {
+  const message = await Message.findById(messageId);
+
+  if (!message || message.deletedForEveryone) {
+    throw new ApiError(404, 'Message not found');
+  }
+
+  const chat = await ensureChatMember(message.chatId, userId);
+  await assertCanPinInChat(chat, userId);
+
+  message.pinnedAt = null;
+  message.pinnedBy = null;
+  await message.save();
+
+  const hydrated = await populateMessage(message._id);
+  const io = getIO();
+  if (io) {
+    io.to(`chat:${message.chatId}`).emit('message:unpinned', {
+      chatId: message.chatId,
+      messageId: message._id,
+    });
+  }
+
+  return hydrated;
 }
 
 async function deleteMessageForEveryone(userId, messageId) {
@@ -228,7 +338,10 @@ async function deleteMessageForEveryone(userId, messageId) {
   }
 
   message.deletedForEveryone = true;
+  message.pinnedAt = null;
+  message.pinnedBy = null;
   await message.save();
+  await refreshChatSummary(message.chatId);
 
   const io = getIO();
   if (io) {
@@ -288,13 +401,34 @@ async function addReaction(userId, messageId, emoji) {
   );
 
   const reactions = await Reaction.find({ messageId: message._id });
+  const io = getIO();
+
+  if (io) {
+    io.to(`chat:${message.chatId}`).emit('message:reactions', {
+      chatId: message.chatId,
+      messageId: message._id,
+      reactions,
+    });
+  }
+
   return reactions;
 }
 
 async function removeReaction(userId, messageId) {
-  await getMessageById(userId, messageId);
+  const message = await getMessageById(userId, messageId);
   await Reaction.findOneAndDelete({ messageId, userId });
-  return Reaction.find({ messageId });
+  const reactions = await Reaction.find({ messageId });
+  const io = getIO();
+
+  if (io) {
+    io.to(`chat:${message.chatId}`).emit('message:reactions', {
+      chatId: message.chatId,
+      messageId: message._id,
+      reactions,
+    });
+  }
+
+  return reactions;
 }
 
 async function markDelivered(userId, messageId) {
@@ -303,6 +437,15 @@ async function markDelivered(userId, messageId) {
   if (!message.deliveredTo.some((id) => String(id) === String(userId))) {
     message.deliveredTo.push(userId);
     await message.save();
+  }
+
+  const io = getIO();
+  if (io) {
+    io.to(`chat:${message.chatId}`).emit('message:delivered', {
+      chatId: message.chatId,
+      messageId: message._id,
+      userId,
+    });
   }
 
   return message;
@@ -335,8 +478,12 @@ async function markSeen(userId, messageId) {
 module.exports = {
   createMessage,
   listMessages,
+  searchMessages,
+  listPinnedMessages,
   getMessageById,
   editMessage,
+  pinMessage,
+  unpinMessage,
   deleteMessageForEveryone,
   deleteMessageForMe,
   replyToMessage,

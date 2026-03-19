@@ -12,6 +12,16 @@ const listMessages = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Messages fetched successfully', result.items, result.meta));
 });
 
+const searchMessages = asyncHandler(async (req, res) => {
+  const result = await service.searchMessages(req.user._id, req.params.chatId, req.query);
+  res.json(new ApiResponse('Messages searched successfully', result.items, result.meta));
+});
+
+const listPinnedMessages = asyncHandler(async (req, res) => {
+  const result = await service.listPinnedMessages(req.user._id, req.params.chatId, req.query);
+  res.json(new ApiResponse('Pinned messages fetched successfully', result.items, result.meta));
+});
+
 const getMessage = asyncHandler(async (req, res) => {
   const message = await service.getMessageById(req.user._id, req.params.messageId);
   res.json(new ApiResponse('Message fetched successfully', message));
@@ -20,6 +30,16 @@ const getMessage = asyncHandler(async (req, res) => {
 const editMessage = asyncHandler(async (req, res) => {
   const message = await service.editMessage(req.user._id, req.params.messageId, req.body.text);
   res.json(new ApiResponse('Message updated successfully', message));
+});
+
+const pinMessage = asyncHandler(async (req, res) => {
+  const message = await service.pinMessage(req.user._id, req.params.messageId);
+  res.json(new ApiResponse('Message pinned successfully', message));
+});
+
+const unpinMessage = asyncHandler(async (req, res) => {
+  const message = await service.unpinMessage(req.user._id, req.params.messageId);
+  res.json(new ApiResponse('Message unpinned successfully', message));
 });
 
 const deleteMessage = asyncHandler(async (req, res) => {
@@ -65,8 +85,12 @@ const markDelivered = asyncHandler(async (req, res) => {
 module.exports = {
   sendMessage,
   listMessages,
+  searchMessages,
+  listPinnedMessages,
   getMessage,
   editMessage,
+  pinMessage,
+  unpinMessage,
   deleteMessage,
   deleteMessageForMe,
   replyToMessage,
@@ -76,4 +100,3 @@ module.exports = {
   markSeen,
   markDelivered,
 };
-

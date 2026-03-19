@@ -10,8 +10,12 @@ router.use(authenticate);
 
 router.post('/', validation.sendMessageValidation, validateRequest, controller.sendMessage);
 router.get('/chat/:chatId', validation.chatMessageListValidation, validateRequest, controller.listMessages);
+router.get('/chat/:chatId/search', validation.messageSearchValidation, validateRequest, controller.searchMessages);
+router.get('/chat/:chatId/pinned', validation.chatMessageListValidation, validateRequest, controller.listPinnedMessages);
 router.get('/:messageId', validation.messageIdValidation, validateRequest, controller.getMessage);
 router.put('/:messageId', validation.editMessageValidation, validateRequest, controller.editMessage);
+router.put('/:messageId/pin', validation.messageIdValidation, validateRequest, controller.pinMessage);
+router.delete('/:messageId/pin', validation.messageIdValidation, validateRequest, controller.unpinMessage);
 router.delete('/:messageId', validation.messageIdValidation, validateRequest, controller.deleteMessage);
 router.delete('/:messageId/for-me', validation.messageIdValidation, validateRequest, controller.deleteMessageForMe);
 router.post('/:messageId/reply', validation.messageIdValidation, validateRequest, controller.replyToMessage);
@@ -22,4 +26,3 @@ router.put('/:messageId/seen', validation.messageIdValidation, validateRequest, 
 router.put('/:messageId/delivered', validation.messageIdValidation, validateRequest, controller.markDelivered);
 
 module.exports = router;
-

@@ -94,6 +94,15 @@ const messageSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    pinnedAt: {
+      type: Date,
+      default: null,
+    },
+    pinnedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
     deletedForEveryone: {
       type: Boolean,
       default: false,
@@ -114,4 +123,3 @@ messageSchema.index({ chatId: 1, createdAt: -1 });
 messageSchema.index({ senderId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Message', messageSchema);
-

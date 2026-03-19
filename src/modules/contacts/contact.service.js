@@ -1,18 +1,13 @@
 const Contact = require('./contact.model');
 const ContactRequest = require('./contactRequest.model');
-const User = require('../users/user.model');
 const ApiError = require('../../utils/ApiError');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const { assertNotBlocked } = require('../../utils/blockCheck');
 const notificationService = require('../notifications/notification.service');
+const { ensureActiveUser } = require('../../utils/privacy');
 
 async function ensureTargetUserExists(userId) {
-  const user = await User.findById(userId);
-  if (!user || !user.isActive) {
-    throw new ApiError(404, 'Target user not found');
-  }
-
-  return user;
+  return ensureActiveUser(userId, 'Target user not found');
 }
 
 async function sendRequest(senderId, receiverId) {
@@ -80,6 +75,7 @@ async function getRequestForReceiver(requestId, receiverId) {
 
 async function acceptRequest(requestId, receiverId) {
   const request = await getRequestForReceiver(requestId, receiverId);
+  await assertNotBlocked(request.senderId, request.receiverId, 'Cannot accept a blocked contact request');
 
   request.status = 'accepted';
   await request.save();
@@ -222,4 +218,3 @@ module.exports = {
   removeContact,
   favoriteContact,
 };
-

@@ -4,6 +4,7 @@ const PrivacySettings = require('../privacy/privacy.model');
 const ApiError = require('../../utils/ApiError');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const { isBlocked } = require('../../utils/blockCheck');
+const { escapeRegex } = require('../../utils/validation');
 
 async function getUserPrivacy(userId) {
   let privacy = await PrivacySettings.findOne({ userId });
@@ -122,7 +123,7 @@ async function getPublicProfile(viewerId, userId) {
 
 async function searchUsers(viewerId, queryParams) {
   const { page, limit, skip } = getPagination(queryParams);
-  const searchRegex = new RegExp(queryParams.query, 'i');
+  const searchRegex = new RegExp(escapeRegex(queryParams.query), 'i');
   const criteria = {
     _id: { $ne: viewerId },
     isActive: true,
@@ -172,4 +173,3 @@ module.exports = {
   searchUsers,
   getMutualContacts,
 };
-

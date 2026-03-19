@@ -1,11 +1,9 @@
 const Chat = require('./chat.model');
-const User = require('../users/user.model');
 const Message = require('../messages/message.model');
-const Contact = require('../contacts/contact.model');
-const PrivacySettings = require('../privacy/privacy.model');
 const ApiError = require('../../utils/ApiError');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
-const { assertNotBlocked } = require('../../utils/blockCheck');
+const { getIO } = require('../../sockets/state');
+const { ensurePrivateMessagingAllowed } = require('../../utils/privacy');
 
 function buildMemberHash(userIdA, userIdB) {
   return [String(userIdA), String(userIdB)].sort().join(':');
@@ -30,31 +28,62 @@ function ensureParticipantSetting(chat, userId) {
   return setting;
 }
 
-async function ensurePrivateMessagingAllowed(requesterId, targetUserId) {
-  await assertNotBlocked(requesterId, targetUserId, 'Private messaging is blocked between these users');
-
-  const target = await User.findById(targetUserId);
-  if (!target || !target.isActive) {
-    throw new ApiError(404, 'Target user not found');
+function buildChatPreview(message) {
+  if (!message) {
+    return '';
   }
 
-  const isContact = await Contact.findOne({
-    userId: requesterId,
-    contactUserId: targetUserId,
-  }).lean();
-
-  if (isContact) {
-    return target;
+  if (message.deletedForEveryone) {
+    return '';
   }
 
-  const privacy = await PrivacySettings.findOne({ userId: targetUserId }).lean();
-  const permission = privacy?.messagePermission || 'contacts';
-
-  if (permission !== 'everyone') {
-    throw new ApiError(403, 'You can only message this user after becoming contacts');
+  if (message.type === 'location') {
+    return 'Location';
   }
 
-  return target;
+  if (message.text?.trim()) {
+    return message.text.slice(0, 120);
+  }
+
+  return message.type || 'Message';
+}
+
+async function emitChatUpdated(chat) {
+  const io = getIO();
+
+  if (!io || !chat) {
+    return;
+  }
+
+  for (const memberId of chat.memberIds) {
+    io.to(`user:${memberId}`).emit('chat:updated', {
+      chatId: chat._id,
+      lastMessageId: chat.lastMessageId,
+      lastMessagePreview: chat.lastMessagePreview,
+      lastMessageAt: chat.lastMessageAt,
+    });
+  }
+}
+
+async function refreshChatSummary(chatId) {
+  const chat = await Chat.findById(chatId);
+
+  if (!chat) {
+    return null;
+  }
+
+  const latestMessage = await Message.findOne({
+    chatId,
+    deletedForEveryone: false,
+  }).sort({ createdAt: -1 });
+
+  chat.lastMessageId = latestMessage?._id || null;
+  chat.lastMessagePreview = buildChatPreview(latestMessage);
+  chat.lastMessageAt = latestMessage?.createdAt || null;
+  await chat.save();
+
+  await emitChatUpdated(chat);
+  return chat;
 }
 
 async function openPrivateChat(userId, otherUserId) {
@@ -166,6 +195,9 @@ async function clearChat(userId, chatId) {
 
 module.exports = {
   buildMemberHash,
+  buildChatPreview,
+  emitChatUpdated,
+  refreshChatSummary,
   ensurePrivateMessagingAllowed,
   openPrivateChat,
   ensureChatMember,
@@ -174,4 +206,3 @@ module.exports = {
   setChatFlag,
   clearChat,
 };
-

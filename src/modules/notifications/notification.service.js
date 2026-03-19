@@ -3,6 +3,18 @@ const ApiError = require('../../utils/ApiError');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const { getIO } = require('../../sockets/state');
 
+async function emitUnreadCount(userId) {
+  const io = getIO();
+
+  if (!io) {
+    return 0;
+  }
+
+  const unreadCount = await Notification.countDocuments({ userId, isRead: false });
+  io.to(`user:${userId}`).emit('notification:count', { unreadCount });
+  return unreadCount;
+}
+
 async function createNotification(payload) {
   const notification = await Notification.create(payload);
   const io = getIO();
@@ -10,6 +22,8 @@ async function createNotification(payload) {
   if (io) {
     io.to(`user:${payload.userId}`).emit('notification:new', notification);
   }
+
+  await emitUnreadCount(payload.userId);
 
   return notification;
 }
@@ -44,6 +58,8 @@ async function markRead(userId, notificationId) {
     io.to(`user:${userId}`).emit('notification:read', { notificationId });
   }
 
+  await emitUnreadCount(userId);
+
   return notification;
 }
 
@@ -54,6 +70,12 @@ async function markAllRead(userId) {
   if (io) {
     io.to(`user:${userId}`).emit('notification:read', { all: true });
   }
+
+  await emitUnreadCount(userId);
+}
+
+async function getUnreadCount(userId) {
+  return Notification.countDocuments({ userId, isRead: false });
 }
 
 module.exports = {
@@ -61,4 +83,6 @@ module.exports = {
   listNotifications,
   markRead,
   markAllRead,
+  getUnreadCount,
+  emitUnreadCount,
 };

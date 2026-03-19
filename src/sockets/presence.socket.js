@@ -1,20 +1,27 @@
 const User = require('../modules/users/user.model');
+const { getUserSocketCount } = require('./state');
 
-function emitPresence(io, userId, isOnline) {
-  io.emit('presence:update', {
+function buildPresencePayload(userId, isOnline, lastSeen = null) {
+  return {
     userId,
     isOnline,
-    lastSeen: isOnline ? null : new Date(),
-  });
+    lastSeen,
+  };
+}
+
+function emitPresence(io, userId, isOnline, lastSeen = null) {
+  io.emit('presence:update', buildPresencePayload(userId, isOnline, lastSeen));
 }
 
 async function setPresence(io, userId, isOnline) {
+  const lastSeen = isOnline ? null : new Date();
+
   await User.findByIdAndUpdate(userId, {
     isOnline,
-    lastSeen: isOnline ? null : new Date(),
+    lastSeen,
   });
 
-  emitPresence(io, userId, isOnline);
+  emitPresence(io, userId, isOnline, lastSeen);
 }
 
 function registerPresenceSocket(io, socket) {
@@ -23,15 +30,17 @@ function registerPresenceSocket(io, socket) {
   });
 
   socket.on('presence:offline', async () => {
-    await setPresence(io, socket.user._id, false);
-  });
+    if (getUserSocketCount(socket.user._id) > 1) {
+      return;
+    }
 
-  socket.on('disconnect', async () => {
     await setPresence(io, socket.user._id, false);
   });
 }
 
 module.exports = {
+  buildPresencePayload,
+  emitPresence,
+  setPresence,
   registerPresenceSocket,
 };
-

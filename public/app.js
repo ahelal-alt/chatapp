@@ -24,13 +24,20 @@ const state = {
   requests: { incoming: [], outgoing: [] },
   groups: [],
   notifications: [],
+  admin: {
+    summary: null,
+  },
+  typingByChat: {},
   toasts: [],
+  socket: null,
+  connectedChatId: null,
 };
 
 init();
 
 appRoot.addEventListener('click', handleClick);
 appRoot.addEventListener('submit', handleSubmit);
+appRoot.addEventListener('input', handleInput);
 
 async function init() {
   const stored = readSession();
@@ -404,7 +411,165 @@ function clearSession() {
   window.localStorage.removeItem(SESSION_KEY);
 }
 
+function disconnectSocket() {
+  if (state.socket) {
+    state.socket.disconnect();
+  }
+
+  state.socket = null;
+  state.connectedChatId = null;
+}
+
+function joinSelectedChatRoom() {
+  if (!state.socket || !state.selectedChatId || state.connectedChatId === state.selectedChatId) {
+    return;
+  }
+
+  if (state.connectedChatId) {
+    state.socket.emit('chat:leave', { chatId: state.connectedChatId });
+  }
+
+  state.connectedChatId = state.selectedChatId;
+  state.socket.emit('chat:join', { chatId: state.selectedChatId });
+}
+
+function upsertChat(chatPatch) {
+  const existingIndex = state.chats.findIndex((item) => item.id === chatPatch.id);
+
+  if (existingIndex >= 0) {
+    state.chats[existingIndex] = { ...state.chats[existingIndex], ...chatPatch };
+    return state.chats[existingIndex];
+  }
+
+  state.chats.unshift(chatPatch);
+  return chatPatch;
+}
+
+function connectLiveSocket() {
+  if (state.dataSource !== 'api' || !state.token || typeof window.io !== 'function') {
+    return;
+  }
+
+  if (state.socket?.connected) {
+    joinSelectedChatRoom();
+    return;
+  }
+
+  disconnectSocket();
+
+  const socket = window.io({
+    auth: {
+      token: state.token,
+    },
+  });
+
+  socket.on('connect', () => {
+    joinSelectedChatRoom();
+  });
+
+  socket.on('presence:update', ({ userId, isOnline, lastSeen }) => {
+    state.contacts = state.contacts.map((contact) => (
+      String(contact.id) === String(userId)
+        ? { ...contact, isOnline, lastSeen: lastSeen || contact.lastSeen }
+        : contact
+    ));
+    render();
+  });
+
+  socket.on('chat:updated', ({ chatId, lastMessagePreview, lastMessageAt }) => {
+    const chat = state.chats.find((item) => item.id === String(chatId));
+    if (!chat) {
+      return;
+    }
+
+    chat.lastMessagePreview = lastMessagePreview || chat.lastMessagePreview;
+    chat.lastMessageAt = lastMessageAt || chat.lastMessageAt;
+    state.chats.sort((left, right) => new Date(right.lastMessageAt) - new Date(left.lastMessageAt));
+    render();
+  });
+
+  socket.on('message:new', (payload) => {
+    const message = normalizeMessage(payload);
+    const chatId = message.chatId;
+    const current = state.messagesByChat[chatId] || [];
+    if (!current.some((item) => item.id === message.id)) {
+      state.messagesByChat[chatId] = [...current, message];
+    }
+
+    const chat = state.chats.find((item) => item.id === chatId);
+    if (chat) {
+      chat.lastMessagePreview = message.text || message.fileName || capitalize(message.type || 'message');
+      chat.lastMessageAt = message.createdAt;
+      if (!message.mine && state.selectedChatId !== chatId) {
+        chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+      }
+    }
+
+    render();
+  });
+
+  socket.on('message:updated', (payload) => {
+    const message = normalizeMessage(payload);
+    state.messagesByChat[message.chatId] = (state.messagesByChat[message.chatId] || []).map((item) => (
+      item.id === message.id ? { ...item, ...message } : item
+    ));
+    render();
+  });
+
+  socket.on('message:deleted', ({ chatId, messageId }) => {
+    state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).filter((item) => item.id !== String(messageId));
+    render();
+  });
+
+  socket.on('message:seen', ({ chatId, messageId }) => {
+    state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).map((item) => (
+      item.id === String(messageId)
+        ? { ...item, seenCount: Number(item.seenCount || 0) + 1 }
+        : item
+    ));
+    render();
+  });
+
+  socket.on('message:typing', ({ chatId, fullName }) => {
+    state.typingByChat[chatId] = `${fullName || 'Someone'} is typing...`;
+    render();
+  });
+
+  socket.on('message:stop-typing', ({ chatId }) => {
+    delete state.typingByChat[chatId];
+    render();
+  });
+
+  socket.on('notification:new', (payload) => {
+    const notification = normalizeNotification(payload);
+    state.notifications = [notification, ...state.notifications.filter((item) => item.id !== notification.id)];
+    render();
+  });
+
+  socket.on('notification:read', ({ notificationId, all }) => {
+    if (all) {
+      state.notifications = state.notifications.map((item) => ({ ...item, isRead: true }));
+    } else {
+      state.notifications = state.notifications.map((item) => (
+        item.id === String(notificationId) ? { ...item, isRead: true } : item
+      ));
+    }
+    render();
+  });
+
+  socket.on('notification:count', ({ unreadCount }) => {
+    const currentUnread = state.notifications.filter((item) => !item.isRead).length;
+    if (unreadCount > currentUnread) {
+      pushToast('New activity', 'Your live notifications have been updated.', 'info');
+    }
+    render();
+  });
+
+  state.socket = socket;
+}
+
 function syncDemoState() {
+  disconnectSocket();
   state.dataSource = 'demo';
   state.user = structuredClone(demoWorkspace.user);
   state.privacy = structuredClone(demoWorkspace.privacy);
@@ -414,6 +579,8 @@ function syncDemoState() {
   state.groups = structuredClone(demoWorkspace.groups);
   state.notifications = structuredClone(demoWorkspace.notifications);
   state.messagesByChat = structuredClone(demoWorkspace.messagesByChat);
+  state.admin.summary = null;
+  state.typingByChat = {};
   state.selectedChatId = state.chats.some((item) => item.id === state.selectedChatId)
     ? state.selectedChatId
     : state.chats[0]?.id || null;
@@ -426,32 +593,49 @@ function syncDemoState() {
 }
 
 async function loadLiveWorkspace() {
+  let profileRes;
+
   try {
     state.isLoading = true;
     render();
 
-    const [profileRes, chatsRes, contactsRes, incomingRes, outgoingRes, notificationsRes] = await Promise.all([
-      apiFetch('/api/v1/users/me'),
+    profileRes = await apiFetch('/api/v1/users/me');
+    const [chatsRes, contactsRes, incomingRes, outgoingRes, notificationsRes, adminRes] = await Promise.allSettled([
       apiFetch('/api/v1/chats?limit=20'),
       apiFetch('/api/v1/contacts?limit=20'),
       apiFetch('/api/v1/contact-requests/incoming?limit=20'),
       apiFetch('/api/v1/contact-requests/outgoing?limit=20'),
       apiFetch('/api/v1/notifications?limit=20'),
+      profileRes.data?.user?.role === 'admin'
+        ? apiFetch('/api/v1/admin/dashboard')
+        : Promise.resolve({ data: null }),
     ]);
 
     const profileData = profileRes.data || {};
     state.dataSource = 'api';
     state.user = normalizeUser(profileData.user);
     state.privacy = normalizePrivacy(profileData.privacy);
-    state.chats = (chatsRes.data || []).map((item) => normalizeChat(item, state.user));
-    state.contacts = (contactsRes.data || []).map(normalizeContact);
+    state.chats = chatsRes.status === 'fulfilled'
+      ? (chatsRes.value.data || []).map((item) => normalizeChat(item, state.user))
+      : [];
+    state.contacts = contactsRes.status === 'fulfilled'
+      ? (contactsRes.value.data || []).map(normalizeContact)
+      : [];
     state.requests = {
-      incoming: (incomingRes.data || []).map((item) => normalizeRequest(item, 'incoming')),
-      outgoing: (outgoingRes.data || []).map((item) => normalizeRequest(item, 'outgoing')),
+      incoming: incomingRes.status === 'fulfilled'
+        ? (incomingRes.value.data || []).map((item) => normalizeRequest(item, 'incoming'))
+        : [],
+      outgoing: outgoingRes.status === 'fulfilled'
+        ? (outgoingRes.value.data || []).map((item) => normalizeRequest(item, 'outgoing'))
+        : [],
     };
-    state.notifications = (notificationsRes.data || []).map(normalizeNotification);
+    state.notifications = notificationsRes.status === 'fulfilled'
+      ? (notificationsRes.value.data || []).map(normalizeNotification)
+      : [];
+    state.admin.summary = adminRes.status === 'fulfilled' ? adminRes.value.data || null : null;
     state.groups = buildGroupsFromChats(state.chats);
     state.messagesByChat = {};
+    state.typingByChat = {};
     state.selectedChatId = state.chats[0]?.id || null;
     state.selectedContactId = state.contacts[0]?.id || null;
     state.selectedGroupId = state.groups[0]?.id || null;
@@ -460,15 +644,44 @@ async function loadLiveWorkspace() {
       await loadChatMessages(state.selectedChatId);
     }
 
+    connectLiveSocket();
+
+    const failedSections = [
+      ['chats', chatsRes],
+      ['contacts', contactsRes],
+      ['incoming requests', incomingRes],
+      ['outgoing requests', outgoingRes],
+      ['notifications', notificationsRes],
+      ['admin dashboard', adminRes],
+    ]
+      .filter(([, result]) => result.status === 'rejected')
+      .map(([label]) => label);
+
+    if (failedSections.length) {
+      pushToast(
+        'Partial live data',
+        `Loaded your session, but these sections fell back to empty state: ${failedSections.join(', ')}.`,
+        'info',
+      );
+    }
+
     state.isLoading = false;
     return true;
   } catch (error) {
-    clearSession();
-    state.token = null;
-    state.refreshToken = null;
+    disconnectSocket();
+    if (error.status === 401) {
+      clearSession();
+      state.token = null;
+      state.refreshToken = null;
+    }
+
     syncDemoState();
     state.isLoading = false;
-    pushToast('Session expired', error.message || 'Live data could not be loaded. Demo mode is ready instead.', 'info');
+    pushToast(
+      error.status === 401 ? 'Session expired' : 'Live data unavailable',
+      error.message || 'Live data could not be loaded. Demo mode is ready instead.',
+      'info',
+    );
     return false;
   }
 }
@@ -586,9 +799,13 @@ function normalizeMessage(item) {
     senderId,
     senderName: sender.fullName || 'Unknown user',
     text: item.text || '',
+    type: item.type || 'text',
+    mediaUrl: item.mediaUrl || '',
+    fileName: item.fileName || '',
     replyText: item.replyToMessageId?.text || '',
     createdAt: item.createdAt,
     editedAt: item.editedAt || null,
+    pinnedAt: item.pinnedAt || null,
     seenCount: item.seenBy?.length || 0,
     mine: String(senderId) === String(state.user?.id),
   };
@@ -628,6 +845,11 @@ async function loadChatMessages(chatId) {
   try {
     const messagesRes = await apiFetch(`/api/v1/messages/chat/${chatId}?limit=50`);
     state.messagesByChat[chatId] = (messagesRes.data || []).map(normalizeMessage).reverse();
+    const chat = state.chats.find((item) => item.id === chatId);
+    if (chat) {
+      chat.unreadCount = 0;
+    }
+    joinSelectedChatRoom();
   } catch (error) {
     pushToast('Messages unavailable', error.message, 'info');
     state.messagesByChat[chatId] = [];
@@ -651,7 +873,10 @@ async function apiFetch(path, options = {}) {
   const payload = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(payload.message || 'Request failed');
+    const error = new Error(payload.message || 'Request failed');
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
 
   return payload;
@@ -703,7 +928,7 @@ function renderAuth() {
         <div class="hero-grid">
           <div class="spotlight-card">
             <strong>Live auth ready</strong>
-            <span>Login and register forms use your real `/api/v1/auth` endpoints when the backend is running.</span>
+            <span>Login and register forms use your real <code>/api/v1/auth</code> endpoints when the backend is running.</span>
           </div>
           <div class="spotlight-card">
             <strong>Demo workspace</strong>
@@ -862,6 +1087,7 @@ function renderWorkspace() {
             ${renderNavButton('requests', 'Requests', pendingCount)}
             ${renderNavButton('groups', 'Groups', state.groups.length)}
             ${renderNavButton('notifications', 'Notifications', unreadCount)}
+            ${state.user?.role === 'admin' ? renderNavButton('admin', 'Admin') : ''}
             ${renderNavButton('profile', 'Profile')}
             ${renderNavButton('settings', 'Settings')}
           </div>
@@ -903,6 +1129,7 @@ function navHint(section) {
     requests: 'Incoming and outgoing',
     groups: 'Rooms and membership',
     notifications: 'Realtime updates',
+    admin: 'Platform overview',
     profile: 'Identity and bio',
     settings: 'Privacy and app rules',
   };
@@ -1043,6 +1270,8 @@ function renderMainPanel() {
       return renderGroupsPanel();
     case 'notifications':
       return renderNotificationsPanel();
+    case 'admin':
+      return renderAdminPanel();
     case 'profile':
       return renderProfilePanel();
     case 'settings':
@@ -1056,6 +1285,7 @@ function renderMainPanel() {
 function renderChatsPanel() {
   const selectedChat = getSelectedChat();
   const messages = selectedChat ? state.messagesByChat[selectedChat.id] || [] : [];
+  const typingText = selectedChat ? state.typingByChat[selectedChat.id] : '';
 
   if (!selectedChat) {
     return `
@@ -1107,6 +1337,7 @@ function renderChatsPanel() {
           ? messages.map(renderMessage).join('')
           : '<div class="empty-card"><h3>No messages yet</h3><p>Send the first message to create the conversation history.</p></div>'}
       </div>
+      ${typingText ? `<div class="helper-text" style="padding: 0 24px 8px;">${escapeHtml(typingText)}</div>` : ''}
       <div class="composer-card">
         <form id="message-form">
           <input type="hidden" name="chatId" value="${selectedChat.id}" />
@@ -1132,8 +1363,10 @@ function renderMessage(message) {
       ${message.mine ? '' : renderAvatar(message.senderName, '', 'small')}
       <div class="message-bubble">
         ${message.replyText ? `<div class="reply-chip">${escapeHtml(message.replyText)}</div>` : ''}
+        ${message.pinnedAt ? '<div class="reply-chip">Pinned message</div>' : ''}
         ${message.mine ? '' : `<strong>${escapeHtml(message.senderName)}</strong>`}
         <p class="message-text">${escapeHtml(message.text)}</p>
+        ${message.mediaUrl ? `<a class="caption" href="${escapeAttribute(message.mediaUrl)}" target="_blank" rel="noreferrer">${escapeHtml(message.fileName || 'Open attachment')}</a>` : ''}
         <div class="message-meta">
           <span>${formatTime(message.createdAt)}</span>
           ${message.editedAt ? '<span>edited</span>' : ''}
@@ -1344,6 +1577,65 @@ function renderNotificationsPanel() {
   `;
 }
 
+function renderAdminPanel() {
+  const summary = state.admin.summary;
+
+  if (!summary) {
+    return `
+      <div class="empty-card">
+        <h3>Admin dashboard unavailable</h3>
+        <p>Once the live admin endpoint responds, system metrics and moderation-ready user data will appear here.</p>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="panel-header">
+      <div>
+        <h2>Admin dashboard</h2>
+        <p>Review system health, moderation context, and recent registrations from one operational surface.</p>
+      </div>
+      <div class="status-pill neutral">${summary.totals.activeUsers} active now</div>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric-card"><span>Total users</span><strong>${summary.totals.users}</strong></div>
+      <div class="metric-card"><span>Total chats</span><strong>${summary.totals.chats}</strong></div>
+      <div class="metric-card"><span>Total groups</span><strong>${summary.totals.groups}</strong></div>
+      <div class="metric-card"><span>Total messages</span><strong>${summary.totals.messages}</strong></div>
+      <div class="metric-card"><span>Suspended users</span><strong>${summary.totals.suspendedUsers}</strong></div>
+      <div class="metric-card"><span>Reports</span><strong>${summary.totals.reports}</strong></div>
+    </div>
+    <div class="cards-grid">
+      <div class="profile-card">
+        <strong>Recent registrations</strong>
+        <div class="list-stack" style="margin-top: 16px;">
+          ${summary.recentRegistrations.length
+            ? summary.recentRegistrations.map((user) => `
+              <div class="mini-card">
+                <strong>${escapeHtml(user.fullName)}</strong>
+                <div class="caption">@${escapeHtml(user.username)} · ${relativeTime(user.createdAt)}</div>
+              </div>
+            `).join('')
+            : '<div class="mini-card"><span class="muted-text">No recent registrations found.</span></div>'}
+        </div>
+      </div>
+      <div class="profile-card">
+        <strong>Moderation queue</strong>
+        <div class="list-stack" style="margin-top: 16px;">
+          ${summary.moderationUsers.length
+            ? summary.moderationUsers.slice(0, 8).map((user) => `
+              <div class="mini-card">
+                <strong>${escapeHtml(user.fullName)}</strong>
+                <div class="caption">@${escapeHtml(user.username)} · ${user.isActive ? 'active' : 'suspended'} · ${user.isOnline ? 'online' : 'offline'}</div>
+              </div>
+            `).join('')
+            : '<div class="mini-card"><span class="muted-text">No users available for moderation.</span></div>'}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderNotificationCard(item) {
   return `
     <div class="notification-card">
@@ -1383,7 +1675,7 @@ function renderProfilePanel() {
           </div>
         </div>
         <div class="helper-text">
-          Changes here use the real `/api/v1/users/me` endpoint when you are authenticated, or stay local while previewing in demo mode.
+          Changes here use the real <code>/api/v1/users/me</code> endpoint when you are authenticated, or stay local while previewing in demo mode.
         </div>
       </div>
       <div class="profile-card">
@@ -1522,6 +1814,22 @@ function renderDetailRail() {
           <div class="metrics-grid" style="grid-template-columns: 1fr;">
             <div class="metric-card"><span>Unread</span><strong>${state.notifications.filter((item) => !item.isRead).length}</strong></div>
             <div class="metric-card"><span>Total</span><strong>${state.notifications.length}</strong></div>
+          </div>
+        </div>
+        ${renderSummaryRail()}
+      </div>
+    `;
+  }
+
+  if (state.activeSection === 'admin') {
+    return `
+      <div class="detail-panel">
+        <div class="profile-card">
+          <strong>Admin context</strong>
+          <p class="helper-text">This section is only visible to admin users and stays empty in demo mode or if the dashboard endpoint is unavailable.</p>
+          <div class="tag-row">
+            <span class="tag">${state.dataSource === 'api' ? 'Live admin data' : 'Demo mode'}</span>
+            <span class="tag">${state.admin.summary ? 'Metrics loaded' : 'Waiting on dashboard'}</span>
           </div>
         </div>
         ${renderSummaryRail()}
@@ -1685,9 +1993,11 @@ async function handleClick(event) {
   }
 
   if (action === 'logout') {
+    disconnectSocket();
     clearSession();
     state.token = null;
     state.refreshToken = null;
+    state.admin.summary = null;
     state.screen = 'auth';
     state.authView = 'login';
     pushToast('Logged out', 'Your session has been cleared.', 'success');
@@ -1791,6 +2101,26 @@ async function handleSubmit(event) {
   if (form.id === 'group-form') {
     await handleGroupCreate(new FormData(form), form);
   }
+}
+
+let typingTimer = null;
+
+function handleInput(event) {
+  const target = event.target;
+
+  if (target.id !== 'message-text' || !state.socket || !state.selectedChatId || state.dataSource !== 'api') {
+    return;
+  }
+
+  state.socket.emit('message:typing', { chatId: state.selectedChatId });
+
+  if (typingTimer) {
+    window.clearTimeout(typingTimer);
+  }
+
+  typingTimer = window.setTimeout(() => {
+    state.socket?.emit('message:stop-typing', { chatId: state.selectedChatId });
+  }, 1200);
 }
 
 async function handleLogin(formData) {
@@ -1916,13 +2246,17 @@ async function handleMessageSubmit(formData, form) {
   }
 
   try {
+    state.socket?.emit('message:stop-typing', { chatId });
     const response = await apiFetch('/api/v1/messages', {
       method: 'POST',
       headers: {},
       body: JSON.stringify({ chatId, text }),
     });
     const message = normalizeMessage(response.data);
-    state.messagesByChat[chatId] = [...(state.messagesByChat[chatId] || []), message];
+    const existingMessages = state.messagesByChat[chatId] || [];
+    state.messagesByChat[chatId] = existingMessages.some((item) => item.id === message.id)
+      ? existingMessages.map((item) => (item.id === message.id ? message : item))
+      : [...existingMessages, message];
     const chat = state.chats.find((item) => item.id === chatId);
     if (chat) {
       chat.lastMessagePreview = message.text;

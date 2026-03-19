@@ -42,6 +42,11 @@ const demoteMember = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Member demoted successfully', member));
 });
 
+const transferOwnership = asyncHandler(async (req, res) => {
+  const group = await service.transferOwnership(req.params.groupId, req.user._id, req.params.userId);
+  res.json(new ApiResponse('Ownership transferred successfully', group));
+});
+
 const leaveGroup = asyncHandler(async (req, res) => {
   await service.leaveGroup(req.params.groupId, req.user._id);
   res.json(new ApiResponse('You left the group successfully'));
@@ -66,8 +71,8 @@ module.exports = {
   removeMember,
   promoteMember,
   demoteMember,
+  transferOwnership,
   leaveGroup,
   generateInviteCode,
   joinByInviteCode,
 };
-

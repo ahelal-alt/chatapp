@@ -1,13 +1,35 @@
 const { body, param } = require('express-validator');
+const { isValidUrlOrUploadPath } = require('../../utils/validation');
 
 const createGroupValidation = [
   body('name').trim().notEmpty().withMessage('name is required'),
+  body('description').optional().isString().trim(),
+  body('image')
+    .optional()
+    .custom((value) => isValidUrlOrUploadPath(value))
+    .withMessage('image must be a valid URL or uploaded file path'),
+  body('onlyAdminsCanMessage').optional().isBoolean(),
+  body('onlyAdminsCanEditInfo').optional().isBoolean(),
+  body('onlyAdminsCanAddMembers').optional().isBoolean(),
   body('memberIds').optional().isArray(),
   body('memberIds.*').optional().isMongoId().withMessage('memberIds must contain valid user ids'),
 ];
 
 const groupIdValidation = [
   param('groupId').isMongoId().withMessage('Invalid group id'),
+];
+
+const updateGroupValidation = [
+  ...groupIdValidation,
+  body('name').optional().trim().notEmpty().withMessage('name cannot be empty'),
+  body('description').optional().isString().trim(),
+  body('image')
+    .optional()
+    .custom((value) => isValidUrlOrUploadPath(value))
+    .withMessage('image must be a valid URL or uploaded file path'),
+  body('onlyAdminsCanMessage').optional().isBoolean(),
+  body('onlyAdminsCanEditInfo').optional().isBoolean(),
+  body('onlyAdminsCanAddMembers').optional().isBoolean(),
 ];
 
 const memberActionValidation = [
@@ -28,8 +50,9 @@ const inviteCodeValidation = [
 module.exports = {
   createGroupValidation,
   groupIdValidation,
+  updateGroupValidation,
   memberActionValidation,
+  transferOwnershipValidation: memberActionValidation,
   addMembersValidation,
   inviteCodeValidation,
 };
-
