@@ -65,11 +65,7 @@ const state = {
   },
   replyDraft: null,
   voiceDraft: null,
-  voiceRecorder: {
-    isRecording: false,
-    isProcessing: false,
-    durationMs: 0,
-  },
+  voiceRecorder: createInitialVoiceRecorderState(),
   modal: null,
 };
 
@@ -79,8 +75,13 @@ appRoot.addEventListener('input', handleInput);
 
 window.addEventListener('online', handleConnectivityChange);
 window.addEventListener('offline', handleConnectivityChange);
+window.addEventListener('pagehide', () => {
+  teardownVoiceLifecycle({ preserveQueuedDraft: true, silent: true });
+  revokeAllTrackedObjectUrls();
+});
 
 let appDbPromise = null;
+const trackedObjectUrls = new Set();
 
 init();
 
@@ -169,6 +170,94 @@ async function dbDelete(storeName, key) {
   });
 }
 
+function createInitialVoiceRecorderState() {
+  return {
+    status: supportsVoiceRecording() ? 'idle' : 'unsupported',
+    durationMs: 0,
+    error: '',
+    recorder: null,
+    stream: null,
+    startedAt: 0,
+    sessionId: '',
+    shouldCreateDraft: false,
+  };
+}
+
+function getActiveVoiceState() {
+  return state.voiceDraft?.status || state.voiceRecorder.status || 'idle';
+}
+
+function createTrackedObjectUrl(blob) {
+  if (typeof URL.createObjectURL !== 'function') {
+    return '';
+  }
+
+  const url = URL.createObjectURL(blob);
+  trackedObjectUrls.add(url);
+  return url;
+}
+
+function revokeTrackedObjectUrl(url) {
+  if (!url || !trackedObjectUrls.has(url) || typeof URL.revokeObjectURL !== 'function') {
+    return;
+  }
+
+  URL.revokeObjectURL(url);
+  trackedObjectUrls.delete(url);
+}
+
+function revokeAllTrackedObjectUrls() {
+  for (const url of [...trackedObjectUrls]) {
+    revokeTrackedObjectUrl(url);
+  }
+}
+
+function setVoiceRecorderStatus(status, extras = {}) {
+  state.voiceRecorder = {
+    ...state.voiceRecorder,
+    ...extras,
+    status,
+  };
+}
+
+function describeVoiceSupportIssue(error) {
+  if (!supportsVoiceRecording()) {
+    return 'Voice recording is not supported in this browser.';
+  }
+
+  switch (error?.name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+      return 'Microphone access was denied. Allow microphone permission to record a voice note.';
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return 'No microphone was found on this device.';
+    case 'AbortError':
+      return 'Recording was interrupted before it could start.';
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return 'The microphone is busy or unavailable right now.';
+    default:
+      return error?.message || 'The microphone could not be accessed.';
+  }
+}
+
+function clearVoiceDurationTimer() {
+  if (voiceDurationTimer) {
+    window.clearInterval(voiceDurationTimer);
+    voiceDurationTimer = null;
+  }
+}
+
+function stopVoiceStream(stream) {
+  stream?.getTracks?.().forEach((track) => track.stop());
+}
+
+function cleanupVoiceRecorderResources() {
+  clearVoiceDurationTimer();
+  stopVoiceStream(state.voiceRecorder?.stream);
+}
+
 function bufferToBase64(value) {
   const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
   let binary = '';
@@ -181,6 +270,37 @@ function bufferToBase64(value) {
 function base64ToBytes(value) {
   const binary = window.atob(value);
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function requiresPrivateEncryption(chat) {
+  return Boolean(
+    chat
+      && chat.type === 'private'
+      && (chat.e2eeCapable || chat.partnerPublicKey),
+  );
+}
+
+function getUndecryptableMessageLabel(message) {
+  if (message?.type === 'voice' || message?.type === 'audio') {
+    return 'Encrypted voice message';
+  }
+  if (message?.type && message.type !== 'text') {
+    return `Encrypted ${message.type} message`;
+  }
+
+  return 'Encrypted message';
+}
+
+function getMessagePreviewText(message) {
+  if (!message) {
+    return 'No messages yet';
+  }
+
+  if (message.isEncrypted) {
+    return message.decryptedText || getUndecryptableMessageLabel(message);
+  }
+
+  return message.text || message.fileName || capitalize(message.type || 'message');
 }
 
 async function exportPublicKeyString(key) {
@@ -293,13 +413,17 @@ async function fetchPartnerEncryptionKey(userId) {
 }
 
 async function encryptPrivateMessage(chat, text) {
-  if (!state.e2ee.ready || !chat?.partnerId) {
+  if (!requiresPrivateEncryption(chat)) {
     return null;
+  }
+
+  if (!state.e2ee.ready || !chat?.partnerId || !state.e2ee.publicKey) {
+    throw new Error('Secure messaging is not ready on this device yet. Refresh your session or sign in again.');
   }
 
   const partnerKeyInfo = await fetchPartnerEncryptionKey(chat.partnerId);
   if (!partnerKeyInfo?.publicKey) {
-    return null;
+    throw new Error('This private conversation is encrypted, but the recipient key is unavailable right now.');
   }
 
   const recipientKey = await importPublicKeyString(partnerKeyInfo.publicKey);
@@ -335,14 +459,34 @@ async function encryptPrivateMessage(chat, text) {
   };
 }
 
-async function decryptMessageContent(message) {
-  if (!message?.isEncrypted || !state.e2ee.privateKey || !state.user?.id) {
-    return message;
+function getCurrentUserEncryptedKey(payload) {
+  return (payload?.encryptedKeys || []).find((item) => String(item.userId) === String(state.user?.id));
+}
+
+async function decryptEncryptedTextPayload(payload) {
+  if (!payload?.isEncrypted) {
+    return {
+      decryptedText: payload?.text || '',
+      decryptionFailed: false,
+      decryptionError: '',
+    };
   }
 
-  const encryptedKey = (message.encryptedKeys || []).find((item) => String(item.userId) === String(state.user.id));
-  if (!encryptedKey?.keyCiphertext) {
-    return { ...message, decryptedText: 'Encrypted message' };
+  if (!state.e2ee.privateKey || !state.user?.id) {
+    return {
+      decryptedText: getUndecryptableMessageLabel(payload),
+      decryptionFailed: true,
+      decryptionError: 'missing_local_key',
+    };
+  }
+
+  const encryptedKey = getCurrentUserEncryptedKey(payload);
+  if (!encryptedKey?.keyCiphertext || !payload.ciphertext || !payload.ciphertextIv) {
+    return {
+      decryptedText: getUndecryptableMessageLabel(payload),
+      decryptionFailed: true,
+      decryptionError: 'missing_encrypted_payload',
+    };
   }
 
   try {
@@ -359,22 +503,70 @@ async function decryptMessageContent(message) {
       ['decrypt'],
     );
     const plaintext = await window.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: base64ToBytes(message.ciphertextIv) },
+      { name: 'AES-GCM', iv: base64ToBytes(payload.ciphertextIv) },
       symmetricKey,
-      base64ToBytes(message.ciphertext),
+      base64ToBytes(payload.ciphertext),
     );
 
     return {
-      ...message,
       decryptedText: new TextDecoder().decode(plaintext),
+      decryptionFailed: false,
+      decryptionError: '',
     };
   } catch (error) {
     return {
-      ...message,
-      decryptedText: 'Encrypted message',
+      decryptedText: getUndecryptableMessageLabel(payload),
       decryptionFailed: true,
+      decryptionError: error?.message || 'decrypt_failed',
     };
   }
+}
+
+async function resolveMessageForDisplay(message) {
+  if (!message?.isEncrypted) {
+    return message;
+  }
+
+  return {
+    ...message,
+    ...(await decryptEncryptedTextPayload(message)),
+  };
+}
+
+async function buildOutgoingTextPayload(chat, text) {
+  const encryptedPayload = await encryptPrivateMessage(chat, text);
+  return {
+    text: encryptedPayload ? '' : text,
+    ...encryptedPayload,
+  };
+}
+
+function sanitizeCachedMessage(message) {
+  if (!message?.isEncrypted) {
+    return message;
+  }
+
+  return {
+    ...message,
+    decryptedText: '',
+    decryptionFailed: false,
+    decryptionError: '',
+  };
+}
+
+function sanitizeCachedChat(chat) {
+  if (!requiresPrivateEncryption(chat)) {
+    return chat;
+  }
+
+  return {
+    ...chat,
+    lastMessagePreview: chat.lastMessagePreview ? 'Encrypted message' : chat.lastMessagePreview,
+  };
+}
+
+async function decryptMessageContent(message) {
+  return resolveMessageForDisplay(message);
 }
 
 async function decryptChatMessages(chatId) {
@@ -383,7 +575,7 @@ async function decryptChatMessages(chatId) {
     return;
   }
 
-  const decrypted = await Promise.all(messages.map((message) => decryptMessageContent(message)));
+  const decrypted = await Promise.all(messages.map((message) => resolveMessageForDisplay(message)));
   state.messagesByChat[chatId] = decrypted;
   await persistChatMessagesCache(chatId);
   render();
@@ -430,7 +622,7 @@ function workspaceSnapshot() {
   return {
     user: state.user,
     privacy: state.privacy,
-    chats: state.chats,
+    chats: state.chats.map(sanitizeCachedChat),
     contacts: state.contacts,
     requests: state.requests,
     groups: state.groups,
@@ -455,7 +647,7 @@ async function persistWorkspaceCache() {
 async function persistChatMessagesCache(chatId) {
   await dbPut('kv', {
     key: `messages:${chatId}`,
-    value: state.messagesByChat[chatId] || [],
+    value: (state.messagesByChat[chatId] || []).map(sanitizeCachedMessage),
   });
 }
 
@@ -493,6 +685,10 @@ async function loadCachedWorkspace() {
 }
 
 function buildLocalPendingMessage(entry) {
+  const mediaUrl = entry.payload.type === 'voice' && entry.fileBlob
+    ? (entry.runtimePreviewUrl || entry.previewUrl || createTrackedObjectUrl(entry.fileBlob))
+    : (entry.previewUrl || entry.payload.mediaUrl || '');
+
   return {
     id: entry.localId,
     clientMessageId: entry.clientMessageId,
@@ -501,12 +697,17 @@ function buildLocalPendingMessage(entry) {
     senderName: state.user?.fullName || 'You',
     text: entry.plaintext || entry.payload.text || '',
     type: entry.payload.type || 'text',
-    mediaUrl: entry.previewUrl || entry.payload.mediaUrl || '',
+    mediaUrl,
     thumbnailUrl: entry.payload.thumbnailUrl || '',
     mimeType: entry.payload.mimeType || '',
     fileName: entry.payload.fileName || '',
     fileSize: Number(entry.payload.fileSize || 0),
     duration: Number(entry.payload.duration || 0),
+    isEncrypted: Boolean(entry.payload.isEncrypted),
+    ciphertext: entry.payload.ciphertext || '',
+    ciphertextIv: entry.payload.ciphertextIv || '',
+    encryptionVersion: Number(entry.payload.encryptionVersion || 0),
+    encryptedKeys: Array.isArray(entry.payload.encryptedKeys) ? entry.payload.encryptedKeys : [],
     replyText: entry.replyText || '',
     createdAt: entry.createdAt,
     editedAt: null,
@@ -514,6 +715,21 @@ function buildLocalPendingMessage(entry) {
     seenCount: 0,
     deliveryState: entry.deliveryState || 'queued',
     mine: true,
+    decryptedText: '',
+    decryptionFailed: false,
+    decryptionError: '',
+  };
+}
+
+async function buildLocalPendingMessageForDisplay(entry) {
+  const message = buildLocalPendingMessage(entry);
+  if (!message.isEncrypted) {
+    return message;
+  }
+
+  return {
+    ...message,
+    ...(await decryptEncryptedTextPayload(message)),
   };
 }
 
@@ -533,18 +749,28 @@ function upsertMessageForChat(chatId, message) {
   state.messagesByChat[chatId] = [...current, message];
 }
 
+function revokePendingMessagePreview(chatId, localMessageId) {
+  const current = state.messagesByChat[chatId] || [];
+  const localMessage = current.find((item) => item.id === localMessageId);
+  revokeTrackedObjectUrl(localMessage?.mediaUrl);
+}
+
 async function queueOutboundMessage(entry) {
-  await dbPut('outbox', entry);
+  const persistedEntry = entry.payload?.isEncrypted
+    ? { ...entry, plaintext: '', localPreviewText: '' }
+    : entry;
+  await dbPut('outbox', persistedEntry);
   state.offline.pendingCount = (await dbGetAll('outbox')).length;
-  const localMessage = buildLocalPendingMessage(entry);
-  upsertMessageForChat(entry.chatId, localMessage);
+  revokePendingMessagePreview(persistedEntry.chatId, persistedEntry.localId);
+  const localMessage = await buildLocalPendingMessageForDisplay(persistedEntry);
+  upsertMessageForChat(persistedEntry.chatId, localMessage);
   syncFilesHubFromMessage(localMessage);
-  const chat = state.chats.find((item) => item.id === entry.chatId);
+  const chat = state.chats.find((item) => item.id === persistedEntry.chatId);
   if (chat) {
-    chat.lastMessagePreview = localMessage.text || localMessage.fileName || 'Pending message';
+    chat.lastMessagePreview = getMessagePreviewText(localMessage) || 'Pending message';
     chat.lastMessageAt = localMessage.createdAt;
   }
-  await persistChatMessagesCache(entry.chatId);
+  await persistChatMessagesCache(persistedEntry.chatId);
   await persistWorkspaceCache();
   render();
 }
@@ -571,11 +797,16 @@ async function hydratePendingOutbox() {
       state.messagesByChat[entry.chatId] = cachedMessages?.value || [];
     }
 
-    const previewUrl = entry.fileBlob && !entry.previewUrl && typeof URL.createObjectURL === 'function'
-      ? URL.createObjectURL(entry.fileBlob)
-      : entry.previewUrl || '';
-    const hydratedEntry = previewUrl !== entry.previewUrl ? { ...entry, previewUrl } : entry;
-    upsertMessageForChat(entry.chatId, buildLocalPendingMessage(hydratedEntry));
+    const runtimePreviewUrl = entry.payload?.type === 'voice' && entry.fileBlob
+      ? createTrackedObjectUrl(entry.fileBlob)
+      : '';
+    const hydratedEntry = {
+      ...entry,
+      deliveryState: entry.deliveryState === 'sending' ? 'queued' : entry.deliveryState,
+      ...(runtimePreviewUrl ? { runtimePreviewUrl } : {}),
+    };
+    revokePendingMessagePreview(entry.chatId, entry.localId);
+    upsertMessageForChat(entry.chatId, await buildLocalPendingMessageForDisplay(hydratedEntry));
   }
 }
 
@@ -597,8 +828,32 @@ async function flushPendingOutbox() {
   for (const entry of entries) {
     try {
       await setOutboxEntryState(entry.id, 'sending');
-      upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: 'sending' }));
+      revokePendingMessagePreview(entry.chatId, entry.localId);
+      upsertMessageForChat(entry.chatId, await buildLocalPendingMessageForDisplay({ ...entry, deliveryState: 'sending' }));
       let payload = { ...entry.payload };
+      const chat = state.chats.find((item) => String(item.id) === String(entry.chatId));
+
+      if (requiresPrivateEncryption(chat)) {
+        if (payload.type && payload.type !== 'text') {
+          const error = new Error('Encrypted private chats currently support secure text messages only.');
+          error.status = 400;
+          throw error;
+        }
+
+        if (!payload.isEncrypted) {
+          const plaintext = String(payload.text || entry.plaintext || '').trim();
+          if (!plaintext) {
+            const error = new Error('Encrypted message payload is incomplete and cannot be retried safely.');
+            error.status = 400;
+            throw error;
+          }
+
+          payload = {
+            ...payload,
+            ...(await buildOutgoingTextPayload(chat, plaintext)),
+          };
+        }
+      }
 
       if (entry.fileBlob) {
         const upload = await uploadChatMediaFile(entry.fileBlob);
@@ -622,12 +877,14 @@ async function flushPendingOutbox() {
       }
       upsertMessageForChat(entry.chatId, message);
       syncFilesHubFromMessage(message);
+      revokePendingMessagePreview(entry.chatId, entry.localId);
       await dbDelete('outbox', entry.id);
       await persistChatMessagesCache(entry.chatId);
     } catch (error) {
       const nextState = error.status ? 'failed' : 'queued';
       await setOutboxEntryState(entry.id, nextState);
-      upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: nextState }));
+      revokePendingMessagePreview(entry.chatId, entry.localId);
+      upsertMessageForChat(entry.chatId, await buildLocalPendingMessageForDisplay({ ...entry, deliveryState: nextState }));
       if (!error.status) {
         state.offline.isOnline = false;
         break;
@@ -654,7 +911,8 @@ async function retryPendingMessage(localMessageId) {
     deliveryState: 'queued',
   });
 
-  upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: 'queued' }));
+  revokePendingMessagePreview(entry.chatId, entry.localId);
+  upsertMessageForChat(entry.chatId, await buildLocalPendingMessageForDisplay({ ...entry, deliveryState: 'queued' }));
   render();
   await flushPendingOutbox();
 }
@@ -1192,9 +1450,7 @@ function connectLiveSocket() {
 
     const chat = state.chats.find((item) => item.id === chatId);
     if (chat) {
-      chat.lastMessagePreview = message.isEncrypted
-        ? (message.decryptedText || 'Encrypted message')
-        : (message.text || message.fileName || capitalize(message.type || 'message'));
+      chat.lastMessagePreview = getMessagePreviewText(message);
       chat.lastMessageAt = message.createdAt;
       if (!message.mine && state.selectedChatId !== chatId) {
         chat.unreadCount = Number(chat.unreadCount || 0) + 1;
@@ -1212,8 +1468,9 @@ function connectLiveSocket() {
     render();
 
     if (message.isEncrypted) {
-      decryptMessageContent(message).then((decryptedMessage) => {
+      resolveMessageForDisplay(message).then((decryptedMessage) => {
         upsertMessageForChat(chatId, decryptedMessage);
+        recalculateChatFromMessages(chatId);
         persistChatMessagesCache(chatId);
         render();
       });
@@ -1230,8 +1487,9 @@ function connectLiveSocket() {
     render();
 
     if (message.isEncrypted) {
-      decryptMessageContent(message).then((decryptedMessage) => {
+      resolveMessageForDisplay(message).then((decryptedMessage) => {
         upsertMessageForChat(message.chatId, decryptedMessage);
+        recalculateChatFromMessages(message.chatId);
         persistChatMessagesCache(message.chatId);
         render();
       });
@@ -1611,6 +1869,7 @@ function normalizeGroup(group) {
 function normalizeMessage(item) {
   const sender = item.senderId || {};
   const senderId = sender._id || sender.id || item.senderId;
+  const replySource = item.replyToMessageId || {};
   return {
     id: item._id || item.id,
     chatId: item.chatId?._id || item.chatId || null,
@@ -1631,13 +1890,16 @@ function normalizeMessage(item) {
     encryptionVersion: Number(item.encryptionVersion || 0),
     encryptedKeys: Array.isArray(item.encryptedKeys) ? item.encryptedKeys : [],
     reactions: normalizeReactions(item.reactions || []),
-    replyText: item.replyToMessageId?.text || '',
+    replyText: replySource.isEncrypted ? getUndecryptableMessageLabel(replySource) : (replySource.text || ''),
     createdAt: item.createdAt,
     editedAt: item.editedAt || null,
     pinnedAt: item.pinnedAt || null,
     seenCount: item.seenBy?.length || 0,
     deliveryState: item.deliveryState || 'sent',
     mine: String(senderId) === String(state.user?.id),
+    decryptedText: item.decryptedText || '',
+    decryptionFailed: Boolean(item.decryptionFailed),
+    decryptionError: item.decryptionError || '',
   };
 }
 
@@ -1997,26 +2259,12 @@ function guessAudioExtension(mimeType) {
 }
 
 function resetVoiceRecorderState() {
-  if (voiceDurationTimer) {
-    window.clearInterval(voiceDurationTimer);
-    voiceDurationTimer = null;
-  }
-
-  if (state.voiceRecorder?.stream) {
-    state.voiceRecorder.stream.getTracks().forEach((track) => track.stop());
-  }
-
-  state.voiceRecorder = {
-    isRecording: false,
-    isProcessing: false,
-    durationMs: 0,
-  };
+  cleanupVoiceRecorderResources();
+  state.voiceRecorder = createInitialVoiceRecorderState();
 }
 
 function discardVoiceDraft({ silent = false } = {}) {
-  if (state.voiceDraft?.previewUrl?.startsWith('blob:') && typeof URL.revokeObjectURL === 'function') {
-    URL.revokeObjectURL(state.voiceDraft.previewUrl);
-  }
+  revokeTrackedObjectUrl(state.voiceDraft?.previewUrl);
 
   state.voiceDraft = null;
 
@@ -2025,23 +2273,88 @@ function discardVoiceDraft({ silent = false } = {}) {
   }
 }
 
+function teardownVoiceLifecycle({ preserveQueuedDraft = false, silent = false } = {}) {
+  const shouldDiscardDraft = state.voiceDraft && (!preserveQueuedDraft || !['queued', 'sending'].includes(state.voiceDraft.status));
+
+  if (state.voiceRecorder?.recorder && state.voiceRecorder.recorder.state !== 'inactive') {
+    state.voiceRecorder.shouldCreateDraft = false;
+    try {
+      state.voiceRecorder.recorder.stop();
+    } catch (error) {
+      // Ignore recorder stop races from browser teardown paths.
+    }
+  }
+
+  resetVoiceRecorderState();
+
+  if (shouldDiscardDraft) {
+    discardVoiceDraft({ silent: true });
+  }
+
+  if (!silent) {
+    render();
+  }
+}
+
+function cleanupVoiceOnContextChange(nextChatId = null) {
+  if (
+    state.voiceRecorder.status === 'recording'
+    || state.voiceRecorder.status === 'requesting_permission'
+    || state.voiceRecorder.status === 'recorded'
+    || state.voiceRecorder.status === 'failed'
+    || state.voiceDraft?.status === 'recorded'
+    || state.voiceDraft?.status === 'failed'
+  ) {
+    if (!nextChatId || String(nextChatId) !== String(state.selectedChatId)) {
+      teardownVoiceLifecycle();
+      pushToast('Voice draft cleared', 'Voice recording was reset because you changed context.', 'info');
+    }
+  }
+}
+
 async function startVoiceRecording() {
   if (!supportsVoiceRecording()) {
+    setVoiceRecorderStatus('unsupported', {
+      error: 'This browser does not support microphone recording.',
+    });
     pushToast('Voice unavailable', 'This browser does not support microphone recording in the current environment.', 'info');
     render();
     return;
   }
 
-  if (state.voiceRecorder.isRecording || state.voiceRecorder.isProcessing) {
+  if (['requesting_permission', 'recording', 'sending'].includes(getActiveVoiceState())) {
     return;
   }
 
+  teardownVoiceLifecycle({ preserveQueuedDraft: true, silent: true });
+
   try {
+    const sessionId = crypto.randomUUID();
+    setVoiceRecorderStatus('requesting_permission', {
+      durationMs: 0,
+      error: '',
+      sessionId,
+      shouldCreateDraft: false,
+    });
+    render();
+
     const stream = await window.navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = getPreferredVoiceMimeType();
     const recorder = mimeType ? new window.MediaRecorder(stream, { mimeType }) : new window.MediaRecorder(stream);
     const startedAt = Date.now();
     const chunks = [];
+
+    recorder.onerror = (event) => {
+      const message = describeVoiceSupportIssue(event?.error);
+      teardownVoiceLifecycle({ preserveQueuedDraft: true, silent: true });
+      state.voiceDraft = {
+        status: 'failed',
+        chatId: state.selectedChatId,
+        error: message,
+      };
+      pushToast('Recording failed', message, 'error');
+      render();
+    };
 
     recorder.ondataavailable = (event) => {
       if (event.data?.size) {
@@ -2050,8 +2363,27 @@ async function startVoiceRecording() {
     };
 
     recorder.onstop = () => {
+      const shouldCreateDraft = state.voiceRecorder.sessionId === sessionId && state.voiceRecorder.shouldCreateDraft;
       const durationMs = Math.max(1000, Date.now() - startedAt);
       const blobType = recorder.mimeType || mimeType || 'audio/webm';
+      cleanupVoiceRecorderResources();
+      state.voiceRecorder = createInitialVoiceRecorderState();
+
+      if (!shouldCreateDraft) {
+        render();
+        return;
+      }
+
+      if (!chunks.length) {
+        state.voiceDraft = {
+          status: 'failed',
+          error: 'No audio was captured. Please try recording again.',
+          chatId: state.selectedChatId,
+        };
+        render();
+        return;
+      }
+
       const blob = new Blob(chunks, { type: blobType });
       const file = new File(
         [blob],
@@ -2061,28 +2393,34 @@ async function startVoiceRecording() {
 
       discardVoiceDraft({ silent: true });
       state.voiceDraft = {
+        status: 'recorded',
+        chatId: state.selectedChatId,
         blob,
         file,
-        previewUrl: typeof URL.createObjectURL === 'function' ? URL.createObjectURL(blob) : '',
+        previewUrl: createTrackedObjectUrl(blob),
         fileName: file.name,
         fileSize: file.size,
         mimeType: file.type,
         duration: Math.max(1, Math.round(durationMs / 1000)),
+        error: '',
       };
-
       resetVoiceRecorderState();
       render();
     };
 
     state.voiceRecorder = {
-      isRecording: true,
-      isProcessing: false,
+      ...createInitialVoiceRecorderState(),
+      status: 'recording',
       durationMs: 0,
+      error: '',
       stream,
       recorder,
       startedAt,
+      sessionId,
+      shouldCreateDraft: true,
     };
 
+    clearVoiceDurationTimer();
     voiceDurationTimer = window.setInterval(() => {
       state.voiceRecorder.durationMs = Date.now() - startedAt;
       render();
@@ -2091,25 +2429,37 @@ async function startVoiceRecording() {
     recorder.start();
     render();
   } catch (error) {
+    const message = describeVoiceSupportIssue(error);
     resetVoiceRecorderState();
-    pushToast('Microphone unavailable', error.message || 'The microphone could not be accessed.', 'error');
+    state.voiceDraft = {
+      status: 'failed',
+      error: message,
+      chatId: state.selectedChatId,
+    };
+    pushToast('Microphone unavailable', message, 'error');
     render();
   }
 }
 
 function stopVoiceRecording() {
-  if (!state.voiceRecorder?.isRecording || !state.voiceRecorder.recorder) {
+  if (state.voiceRecorder?.status !== 'recording' || !state.voiceRecorder.recorder) {
     return;
   }
 
-  if (voiceDurationTimer) {
-    window.clearInterval(voiceDurationTimer);
-    voiceDurationTimer = null;
+  clearVoiceDurationTimer();
+  setVoiceRecorderStatus('recorded', {
+    shouldCreateDraft: true,
+  });
+  try {
+    state.voiceRecorder.recorder.stop();
+  } catch (error) {
+    teardownVoiceLifecycle({ preserveQueuedDraft: true, silent: true });
+    state.voiceDraft = {
+      status: 'failed',
+      error: 'Recording could not be stopped cleanly. Please try again.',
+      chatId: state.selectedChatId,
+    };
   }
-
-  state.voiceRecorder.isRecording = false;
-  state.voiceRecorder.isProcessing = true;
-  state.voiceRecorder.recorder.stop();
   render();
 }
 
@@ -2118,27 +2468,60 @@ async function sendVoiceDraft(chatId) {
     return;
   }
 
+  const chat = state.chats.find((item) => String(item.id) === String(chatId));
+  if (requiresPrivateEncryption(chat)) {
+    state.voiceDraft = {
+      ...state.voiceDraft,
+      status: 'failed',
+      error: 'Voice notes are not end-to-end encrypted in private chats yet.',
+    };
+    pushToast('Encrypted chat only supports secure text for now', state.voiceDraft.error, 'info');
+    render();
+    return;
+  }
+
+  if (state.voiceDraft.chatId && String(state.voiceDraft.chatId) !== String(chatId)) {
+    pushToast('Voice draft moved', 'This voice note belongs to a different chat context and was cleared.', 'info');
+    discardVoiceDraft();
+    return;
+  }
+
+  if (['sending', 'queued'].includes(state.voiceDraft.status)) {
+    return;
+  }
+
+  if (!state.voiceDraft.file) {
+    state.voiceDraft = {
+      ...state.voiceDraft,
+      status: 'failed',
+      error: 'The recorded audio is no longer available. Please record it again.',
+    };
+    pushToast('Voice unavailable', state.voiceDraft.error, 'error');
+    render();
+    return;
+  }
+
+  const currentDraft = { ...state.voiceDraft };
   const clientMessageId = crypto.randomUUID();
   const queueEntry = {
     id: clientMessageId,
     localId: `local-${clientMessageId}`,
     clientMessageId,
     chatId,
-    plaintext: text,
+    kind: 'voice',
     replyText: state.replyDraft?.text || '',
     createdAt: new Date().toISOString(),
     deliveryState: 'queued',
-    previewUrl: state.voiceDraft.previewUrl,
-    fileBlob: state.voiceDraft.file,
+    fileBlob: currentDraft.file,
     payload: {
       chatId,
       clientMessageId,
       type: 'voice',
       text: '',
-      mimeType: state.voiceDraft.mimeType,
-      fileName: state.voiceDraft.fileName,
-      fileSize: state.voiceDraft.fileSize,
-      duration: state.voiceDraft.duration,
+      mimeType: currentDraft.mimeType,
+      fileName: currentDraft.fileName,
+      fileSize: currentDraft.fileSize,
+      duration: currentDraft.duration,
       replyToMessageId: state.replyDraft?.id || null,
     },
   };
@@ -2151,11 +2534,11 @@ async function sendVoiceDraft(chatId) {
       senderName: state.user.fullName,
       text: '',
       type: 'voice',
-      mediaUrl: state.voiceDraft.previewUrl,
-      fileName: state.voiceDraft.fileName,
-      fileSize: state.voiceDraft.fileSize,
-      mimeType: state.voiceDraft.mimeType,
-      duration: state.voiceDraft.duration,
+      mediaUrl: currentDraft.previewUrl,
+      fileName: currentDraft.fileName,
+      fileSize: currentDraft.fileSize,
+      mimeType: currentDraft.mimeType,
+      duration: currentDraft.duration,
       replyText: '',
       createdAt: new Date().toISOString(),
       editedAt: null,
@@ -2178,6 +2561,11 @@ async function sendVoiceDraft(chatId) {
   }
 
   if (!state.offline.isOnline) {
+    state.voiceDraft = {
+      ...state.voiceDraft,
+      status: 'queued',
+    };
+    queueEntry.previewUrl = createTrackedObjectUrl(currentDraft.blob || currentDraft.file);
     await queueOutboundMessage(queueEntry);
     state.replyDraft = null;
     discardVoiceDraft({ silent: true });
@@ -2188,8 +2576,13 @@ async function sendVoiceDraft(chatId) {
 
   try {
     state.isSubmitting = true;
+    state.voiceDraft = {
+      ...state.voiceDraft,
+      status: 'sending',
+      error: '',
+    };
     render();
-    const upload = await uploadChatMediaFile(state.voiceDraft.file);
+    const upload = await uploadChatMediaFile(currentDraft.file);
     const response = await apiFetch('/api/v1/messages', {
       method: 'POST',
       headers: {},
@@ -2199,10 +2592,10 @@ async function sendVoiceDraft(chatId) {
         type: 'voice',
         text: '',
         mediaUrl: upload.data?.url,
-        mimeType: upload.data?.mimeType || state.voiceDraft.mimeType,
-        fileName: upload.data?.fileName || state.voiceDraft.fileName,
-        fileSize: upload.data?.fileSize || state.voiceDraft.fileSize,
-        duration: state.voiceDraft.duration,
+        mimeType: upload.data?.mimeType || currentDraft.mimeType,
+        fileName: upload.data?.fileName || currentDraft.fileName,
+        fileSize: upload.data?.fileSize || currentDraft.fileSize,
+        duration: currentDraft.duration,
         replyToMessageId: state.replyDraft?.id || null,
       }),
     });
@@ -2224,11 +2617,22 @@ async function sendVoiceDraft(chatId) {
     pushToast('Voice sent', 'Your voice message is now part of the conversation.', 'success');
   } catch (error) {
     if (!error.status) {
+      state.voiceDraft = {
+        ...state.voiceDraft,
+        status: 'queued',
+        error: '',
+      };
+      queueEntry.previewUrl = createTrackedObjectUrl(currentDraft.blob || currentDraft.file);
       await queueOutboundMessage(queueEntry);
       state.replyDraft = null;
       discardVoiceDraft({ silent: true });
       pushToast('Voice queued', 'The network dropped, so the voice note was queued locally.', 'info');
     } else {
+      state.voiceDraft = {
+        ...state.voiceDraft,
+        status: 'failed',
+        error: error.message,
+      };
       pushToast('Voice send failed', error.message, 'error');
     }
   } finally {
@@ -2771,9 +3175,7 @@ function getChatPreviewText(chat) {
   }
 
   const latestMessage = (state.messagesByChat[chat.id] || []).slice(-1)[0];
-  const latestText = latestMessage?.isEncrypted
-    ? (latestMessage.decryptedText || 'Encrypted message')
-    : latestMessage?.text;
+  const latestText = latestMessage ? getMessagePreviewText(latestMessage) : '';
   if (latestMessage?.mine && latestText) {
     return {
       text: `You: ${latestText}`,
@@ -2877,6 +3279,7 @@ function renderChatsPanel() {
   const messages = selectedChat ? state.messagesByChat[selectedChat.id] || [] : [];
   const typingText = selectedChat ? state.typingByChat[selectedChat.id] : '';
   const e2eeActive = isE2EEActiveForChat(selectedChat);
+  const voiceState = getActiveVoiceState();
 
   if (!selectedChat) {
     return `
@@ -2953,19 +3356,20 @@ function renderChatsPanel() {
             <textarea id="message-text" class="composer-input" name="text" placeholder="Write a message..." rows="3"></textarea>
             <button class="ghost-button icon-button" type="button" data-action="composer-attach" title="Add attachment">+</button>
             <button
-              class="ghost-button icon-button ${state.voiceRecorder.isRecording ? 'is-recording' : ''}"
+              class="ghost-button icon-button ${voiceState === 'recording' ? 'is-recording' : ''} ${voiceState === 'unsupported' ? 'is-disabled' : ''}"
               type="button"
               data-action="toggle-recording"
-              title="${state.voiceRecorder.isRecording ? 'Stop recording' : 'Record voice note'}"
-            >${state.voiceRecorder.isRecording ? '■' : '🎙'}</button>
+              title="${voiceState === 'recording' ? 'Stop recording' : voiceState === 'unsupported' ? 'Voice recording unavailable' : 'Record voice note'}"
+              ${voiceState === 'unsupported' ? 'disabled' : ''}
+            >${voiceState === 'recording' ? '■' : '🎙'}</button>
           </div>
           <div class="composer-actions">
             <div class="tag-row">
               <span class="tag">Seen status</span>
               <span class="tag">Reply-ready</span>
-              <span class="tag">${state.voiceDraft ? 'Voice preview ready' : state.voiceRecorder.isRecording ? `Recording ${formatDuration(Math.ceil(state.voiceRecorder.durationMs / 1000))}` : 'Voice-ready'}</span>
+              <span class="tag">${voiceState === 'recording' ? `Recording ${formatDuration(Math.ceil(state.voiceRecorder.durationMs / 1000))}` : voiceState === 'queued' ? 'Voice queued' : voiceState === 'failed' ? 'Voice failed' : voiceState === 'unsupported' ? 'Voice unsupported' : state.voiceDraft ? 'Voice preview ready' : 'Voice-ready'}</span>
             </div>
-            <button class="primary-button" type="submit" ${state.voiceRecorder.isRecording || state.isSubmitting ? 'disabled' : ''}>Send message</button>
+            <button class="primary-button" type="submit" ${voiceState === 'recording' || voiceState === 'requesting_permission' || voiceState === 'sending' || state.isSubmitting ? 'disabled' : ''}>Send message</button>
           </div>
         </form>
       </div>
@@ -2974,7 +3378,29 @@ function renderChatsPanel() {
 }
 
 function renderVoiceDraftPreview() {
-  if (state.voiceRecorder.isRecording) {
+  if (state.voiceRecorder.status === 'unsupported') {
+    return `
+      <div class="voice-draft-card is-warning">
+        <div class="voice-draft-copy">
+          <strong>Voice recording unavailable</strong>
+          <span class="caption">${escapeHtml(state.voiceRecorder.error || 'This browser does not currently support microphone recording.')}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  if (state.voiceRecorder.status === 'requesting_permission') {
+    return `
+      <div class="voice-draft-card">
+        <div class="voice-draft-copy">
+          <strong>Requesting microphone permission</strong>
+          <span class="caption">Allow microphone access in the browser prompt to start recording.</span>
+        </div>
+      </div>
+    `;
+  }
+
+  if (state.voiceRecorder.status === 'recording') {
     return `
       <div class="voice-draft-card is-recording">
         <div class="voice-draft-copy">
@@ -2989,31 +3415,22 @@ function renderVoiceDraftPreview() {
     `;
   }
 
-  if (state.voiceRecorder.isProcessing) {
-    return `
-      <div class="voice-draft-card">
-        <div class="voice-draft-copy">
-          <strong>Preparing your voice note</strong>
-          <span class="caption">Processing the recorded audio preview…</span>
-        </div>
-      </div>
-    `;
-  }
-
   if (!state.voiceDraft) {
     return '';
   }
 
   return `
-    <div class="voice-draft-card">
+    <div class="voice-draft-card ${state.voiceDraft.status === 'failed' ? 'is-error' : state.voiceDraft.status === 'queued' ? 'is-warning' : ''}">
       <div class="voice-draft-copy">
-        <strong>Voice note ready</strong>
-        <span class="caption">${formatDuration(state.voiceDraft.duration)} • ${formatFileSize(state.voiceDraft.fileSize)}</span>
+        <strong>${state.voiceDraft.status === 'failed' ? 'Voice note failed' : state.voiceDraft.status === 'queued' ? 'Voice note queued' : state.voiceDraft.status === 'sending' ? 'Sending voice note' : 'Voice note ready'}</strong>
+        <span class="caption">${formatDuration(state.voiceDraft.duration || 0)} • ${formatFileSize(state.voiceDraft.fileSize || 0)}${state.voiceDraft.error ? ` • ${escapeHtml(state.voiceDraft.error)}` : ''}</span>
       </div>
-      <audio class="voice-preview-player" controls preload="metadata" src="${escapeAttribute(state.voiceDraft.previewUrl)}"></audio>
+      ${state.voiceDraft.previewUrl
+        ? `<audio class="voice-preview-player" controls preload="metadata" src="${escapeAttribute(state.voiceDraft.previewUrl)}"></audio>`
+        : ''}
       <div class="request-actions">
         <button class="ghost-button" type="button" data-action="discard-voice">Discard</button>
-        <button class="primary-button" type="button" data-action="send-voice">Send voice</button>
+        <button class="primary-button" type="button" data-action="send-voice" ${['sending', 'queued'].includes(state.voiceDraft.status) ? 'disabled' : ''}>${state.voiceDraft.status === 'failed' ? 'Retry send' : 'Send voice'}</button>
       </div>
     </div>
   `;
@@ -3119,7 +3536,7 @@ function renderMessage(message) {
   const isImage = isImageAttachment(message);
   const isVoice = message.type === 'voice';
   const isPending = ['queued', 'sending', 'failed'].includes(message.deliveryState);
-  const visibleText = message.isEncrypted ? (message.decryptedText || 'Encrypted message') : message.text;
+  const visibleText = message.isEncrypted ? (message.decryptedText || getUndecryptableMessageLabel(message)) : message.text;
   const reactions = aggregateReactions(message.reactions || []);
 
   return `
@@ -3926,8 +4343,8 @@ async function handleClick(event) {
 
   if (action === 'logout') {
     disconnectSocket();
-    discardVoiceDraft({ silent: true });
-    resetVoiceRecorderState();
+    teardownVoiceLifecycle({ silent: true });
+    revokeAllTrackedObjectUrls();
     clearSession();
     state.token = null;
     state.refreshToken = null;
@@ -3941,6 +4358,9 @@ async function handleClick(event) {
   }
 
   if (action === 'switch-section') {
+    if (target.dataset.section !== 'chats') {
+      cleanupVoiceOnContextChange(null);
+    }
     state.activeSection = target.dataset.section;
     if (state.activeSection === 'files') {
       await loadFilesHub({ silent: true });
@@ -3977,7 +4397,7 @@ async function handleClick(event) {
   }
 
   if (action === 'toggle-recording') {
-    if (state.voiceRecorder.isRecording) {
+    if (state.voiceRecorder.status === 'recording') {
       stopVoiceRecording();
     } else {
       await startVoiceRecording();
@@ -4105,6 +4525,7 @@ async function handleClick(event) {
   }
 
   if (action === 'open-file-chat') {
+    cleanupVoiceOnContextChange(target.dataset.chatId || null);
     state.activeSection = 'chats';
     state.selectedChatId = target.dataset.chatId || state.selectedChatId;
     await loadChatMessages(state.selectedChatId);
@@ -4113,6 +4534,7 @@ async function handleClick(event) {
   }
 
   if (action === 'select-chat') {
+    cleanupVoiceOnContextChange(target.dataset.chatId || null);
     state.activeSection = 'chats';
     state.replyDraft = null;
     state.selectedChatId = target.dataset.chatId;
@@ -4122,6 +4544,7 @@ async function handleClick(event) {
   }
 
   if (action === 'select-contact') {
+    cleanupVoiceOnContextChange(null);
     state.activeSection = 'contacts';
     state.selectedContactId = target.dataset.contactId;
     render();
@@ -4129,6 +4552,7 @@ async function handleClick(event) {
   }
 
   if (action === 'select-group') {
+    cleanupVoiceOnContextChange(null);
     state.activeSection = 'groups';
     state.selectedGroupId = target.dataset.groupId;
     render();
@@ -4454,7 +4878,15 @@ async function handleMessageSubmit(formData, form) {
 
   const selectedChat = state.chats.find((item) => item.id === chatId);
   const clientMessageId = crypto.randomUUID();
-  const encryptedPayload = selectedChat?.type === 'private' ? await encryptPrivateMessage(selectedChat, text) : null;
+  let outgoingPayload;
+  try {
+    outgoingPayload = await buildOutgoingTextPayload(selectedChat, text);
+  } catch (error) {
+    pushToast('Secure send unavailable', error.message, 'error');
+    render();
+    return;
+  }
+
   const queueEntry = {
     id: clientMessageId,
     localId: `local-${clientMessageId}`,
@@ -4466,8 +4898,7 @@ async function handleMessageSubmit(formData, form) {
     payload: {
       chatId,
       clientMessageId,
-      text: encryptedPayload ? '' : text,
-      ...encryptedPayload,
+      ...outgoingPayload,
       replyToMessageId: state.replyDraft?.id || null,
     },
   };
@@ -4523,7 +4954,7 @@ async function handleMessageSubmit(formData, form) {
       : [...existingMessages, message];
     const chat = state.chats.find((item) => item.id === chatId);
     if (chat) {
-      chat.lastMessagePreview = encryptedPayload ? text : message.text;
+      chat.lastMessagePreview = getMessagePreviewText(message);
       chat.lastMessageAt = message.createdAt;
     }
     state.replyDraft = null;
@@ -4624,6 +5055,7 @@ async function openChatWithContact(contactId) {
     }
   }
 
+  cleanupVoiceOnContextChange(chat.id);
   state.selectedChatId = chat.id;
   state.activeSection = 'chats';
   pushToast('Chat ready', `Opened a conversation with ${contact.fullName}.`, 'success');
@@ -4952,9 +5384,7 @@ function recalculateChatFromMessages(chatId) {
     return;
   }
 
-  chat.lastMessagePreview = latest.isEncrypted
-    ? (latest.decryptedText || 'Encrypted message')
-    : (latest.text || latest.fileName || capitalize(latest.type || 'message'));
+  chat.lastMessagePreview = getMessagePreviewText(latest);
   chat.lastMessageAt = latest.createdAt;
 }
 

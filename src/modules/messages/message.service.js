@@ -126,6 +126,14 @@ async function createMessage(senderId, payload) {
     if (!payload.ciphertext || !payload.ciphertextIv || !Array.isArray(payload.encryptedKeys) || !payload.encryptedKeys.length) {
       throw new ApiError(400, 'Encrypted messages require ciphertext, iv, and encryptedKeys');
     }
+
+    if (String(payload.text || '').trim()) {
+      throw new ApiError(400, 'Encrypted messages must not include plaintext text');
+    }
+
+    if (payload.mediaUrl || (payload.type && payload.type !== 'text')) {
+      throw new ApiError(400, 'Encrypted private chats currently support secure text messages only');
+    }
   }
 
   const message = await Message.create({
