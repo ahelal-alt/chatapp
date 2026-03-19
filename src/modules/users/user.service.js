@@ -163,6 +163,44 @@ async function getMutualContacts(userId, otherUserId) {
   return users;
 }
 
+async function saveMyEncryptionKey(userId, payload) {
+  const user = await User.findByIdAndUpdate(
+    userId,
+    {
+      encryptionPublicKey: payload.publicKey,
+      encryptionKeyVersion: payload.keyVersion || 1,
+      encryptionEnabled: true,
+    },
+    { new: true, runValidators: true },
+  );
+
+  return {
+    encryptionEnabled: Boolean(user?.encryptionEnabled),
+    encryptionPublicKey: user?.encryptionPublicKey || '',
+    encryptionKeyVersion: user?.encryptionKeyVersion || 0,
+  };
+}
+
+async function getUserEncryptionKey(viewerId, userId) {
+  const user = await User.findById(userId).select('fullName encryptionPublicKey encryptionKeyVersion encryptionEnabled isActive');
+
+  if (!user || !user.isActive) {
+    throw new ApiError(404, 'User not found');
+  }
+
+  if (viewerId && String(viewerId) !== String(userId) && await isBlocked(viewerId, userId)) {
+    throw new ApiError(403, 'You cannot access this encryption key');
+  }
+
+  return {
+    userId: user._id,
+    fullName: user.fullName,
+    encryptionEnabled: Boolean(user.encryptionEnabled),
+    publicKey: user.encryptionPublicKey || '',
+    keyVersion: user.encryptionKeyVersion || 0,
+  };
+}
+
 module.exports = {
   getUserPrivacy,
   areContacts,
@@ -172,4 +210,6 @@ module.exports = {
   getPublicProfile,
   searchUsers,
   getMutualContacts,
+  saveMyEncryptionKey,
+  getUserEncryptionKey,
 };

@@ -1308,6 +1308,31 @@ body {
   overflow: hidden;
 }
 
+.connection-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 16px;
+  padding: 14px 18px;
+  border-radius: 20px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+}
+
+.connection-banner.warning {
+  background: rgba(245, 158, 11, 0.14);
+}
+
+.connection-banner.info {
+  background: rgba(59, 130, 246, 0.14);
+}
+
+.connection-banner.success {
+  background: rgba(34, 197, 94, 0.14);
+}
+
 .chat-layout {
   min-height: 720px;
 }
@@ -1339,6 +1364,16 @@ body {
 
 .message-bubble.received {
   background: rgba(255, 255, 255, 0.04);
+}
+
+.message-bubble.is-queued,
+.message-bubble.is-sending,
+.message-bubble.is-failed {
+  border: 1px dashed rgba(148, 163, 184, 0.26);
+}
+
+.message-bubble.is-failed {
+  border-color: rgba(239, 68, 68, 0.5);
 }
 
 :root[data-theme="light"] .message-bubble.received {
@@ -1495,6 +1530,84 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(48px, 1fr));
   gap: var(--space-3);
   align-items: end;
+}
+
+.files-toolbar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.field-group {
+  display: grid;
+  gap: 8px;
+}
+
+.field-group span {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.files-toolbar-actions {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+}
+
+.files-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--space-4);
+}
+
+.file-card {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border-radius: 24px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: var(--shadow-soft);
+}
+
+.file-card-preview {
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+  border-radius: 20px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(15, 23, 42, 0.32);
+  overflow: hidden;
+}
+
+.file-card-preview.has-media img,
+.file-card-preview.has-media video {
+  width: 100%;
+  height: 220px;
+  object-fit: cover;
+}
+
+.file-card-preview audio {
+  width: calc(100% - 24px);
+}
+
+.file-card-icon {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  border-radius: 24px;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(139, 92, 246, 0.18));
+  color: var(--text-primary);
+  font-size: 30px;
+  font-weight: 800;
+}
+
+.file-card-copy {
+  display: grid;
+  gap: 10px;
 }
 
 .chart-bar-card {

@@ -10,6 +10,7 @@ router.use(authenticate);
 
 router.get('/me', controller.getMe);
 router.put('/me', validation.updateMeValidation, validateRequest, controller.updateMe);
+router.put('/me/encryption-key', validation.encryptionKeyValidation, validateRequest, controller.saveMyEncryptionKey);
 router.put(
   '/me/profile-image',
   validation.profileImageValidation,
@@ -17,6 +18,7 @@ router.put(
   controller.updateMyProfileImage,
 );
 router.get('/search', validation.searchUsersValidation, validateRequest, controller.searchUsers);
+router.get('/:userId/encryption-key', validation.userIdValidation, validateRequest, controller.getUserEncryptionKey);
 router.get('/:userId/profile', validation.userIdValidation, validateRequest, controller.getProfileById);
 router.get(
   '/:userId/mutual-contacts',
@@ -26,4 +28,3 @@ router.get(
 );
 
 module.exports = router;
-

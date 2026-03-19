@@ -28,9 +28,15 @@ const searchUsersValidation = [
   query('limit').optional().isInt({ min: 1, max: 100 }),
 ];
 
+const encryptionKeyValidation = [
+  body('publicKey').isString().isLength({ min: 40, max: 20000 }).withMessage('publicKey is required'),
+  body('keyVersion').optional().isInt({ min: 1, max: 100 }),
+];
+
 module.exports = {
   updateMeValidation,
   profileImageValidation,
   userIdValidation,
   searchUsersValidation,
+  encryptionKeyValidation,
 };

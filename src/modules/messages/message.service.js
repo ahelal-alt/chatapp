@@ -20,6 +20,7 @@ const {
 function hasMessagePayload(payload) {
   return Boolean(
     payload.text?.trim()
+      || payload.ciphertext
       || payload.mediaUrl
       || (payload.latitude !== undefined && payload.longitude !== undefined),
   );
@@ -102,18 +103,48 @@ async function createMessage(senderId, payload) {
   const chat = await ensureChatMember(payload.chatId, senderId);
   await assertCanSendToChat(chat, senderId);
 
+  if (payload.clientMessageId) {
+    const existing = await Message.findOne({
+      senderId,
+      chatId: chat._id,
+      clientMessageId: payload.clientMessageId,
+    });
+
+    if (existing) {
+      return populateMessage(existing._id);
+    }
+  }
+
   const recipientIds = chat.memberIds.filter((memberId) => String(memberId) !== String(senderId));
+  const isEncrypted = Boolean(payload.isEncrypted);
+
+  if (isEncrypted) {
+    if (chat.type !== 'private') {
+      throw new ApiError(400, 'End-to-end encryption is currently available only for private chats');
+    }
+
+    if (!payload.ciphertext || !payload.ciphertextIv || !Array.isArray(payload.encryptedKeys) || !payload.encryptedKeys.length) {
+      throw new ApiError(400, 'Encrypted messages require ciphertext, iv, and encryptedKeys');
+    }
+  }
+
   const message = await Message.create({
     chatId: chat._id,
     senderId,
+    clientMessageId: payload.clientMessageId || '',
     type: payload.type || (payload.mediaUrl ? 'file' : 'text'),
-    text: payload.text || '',
+    text: isEncrypted ? '' : (payload.text || ''),
     mediaUrl: payload.mediaUrl || '',
     thumbnailUrl: payload.thumbnailUrl || '',
     mimeType: payload.mimeType || '',
     fileName: payload.fileName || '',
     fileSize: payload.fileSize || 0,
     duration: payload.duration || 0,
+    isEncrypted,
+    ciphertext: payload.ciphertext || '',
+    ciphertextIv: payload.ciphertextIv || '',
+    encryptionVersion: payload.encryptionVersion || 0,
+    encryptedKeys: payload.encryptedKeys || [],
     latitude: payload.latitude ?? null,
     longitude: payload.longitude ?? null,
     replyToMessageId: payload.replyToMessageId || null,
@@ -135,7 +166,7 @@ async function createMessage(senderId, payload) {
       userId: recipientId,
       type: chat.type === 'private' ? 'private_message' : 'group_message',
       title: chat.type === 'private' ? 'New message' : 'New group message',
-      body: buildChatPreview(message),
+      body: message.isEncrypted && chat.type === 'private' ? 'Encrypted message' : buildChatPreview(message),
       data: {
         chatId: chat._id,
         messageId: message._id,

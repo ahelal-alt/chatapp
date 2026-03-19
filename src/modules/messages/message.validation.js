@@ -18,6 +18,11 @@ const sendMessageValidation = [
     .optional()
     .custom((value) => isValidUrlOrUploadPath(value))
     .withMessage('thumbnailUrl must be a valid URL or uploaded file path'),
+  body('isEncrypted').optional().isBoolean(),
+  body('ciphertext').optional().isString().isLength({ min: 1, max: 500000 }),
+  body('ciphertextIv').optional().isString().isLength({ min: 1, max: 1000 }),
+  body('encryptionVersion').optional().isInt({ min: 1, max: 10 }),
+  body('encryptedKeys').optional().isArray({ min: 1 }),
   body('replyToMessageId').optional().isMongoId().withMessage('replyToMessageId must be a valid message id'),
   body('forwardedFromMessageId').optional().isMongoId().withMessage('forwardedFromMessageId must be a valid message id'),
   body('latitude').optional().isFloat(),

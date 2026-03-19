@@ -1,6 +1,8 @@
 const appRoot = document.getElementById('app');
 const SESSION_KEY = 'pulsechat-session';
 const THEME_KEY = 'pulsechat-theme';
+const APP_DB_NAME = 'pulsechat-app-db';
+const APP_DB_VERSION = 1;
 
 const demoWorkspace = createDemoWorkspace();
 
@@ -41,12 +43,26 @@ const state = {
   admin: {
     summary: null,
   },
+  e2ee: {
+    supported: Boolean(window.crypto?.subtle),
+    ready: false,
+    privateKey: null,
+    publicKey: '',
+    keyVersion: 0,
+    partnerKeys: {},
+  },
   typingByChat: {},
   toasts: [],
   socket: null,
   connectedChatId: null,
   theme: 'dark',
   liveConnectionState: 'idle',
+  offline: {
+    isOnline: window.navigator?.onLine ?? true,
+    isSyncing: false,
+    usingCachedWorkspace: false,
+    pendingCount: 0,
+  },
   replyDraft: null,
   voiceDraft: null,
   voiceRecorder: {
@@ -57,15 +73,326 @@ const state = {
   modal: null,
 };
 
-init();
-
 appRoot.addEventListener('click', handleClick);
 appRoot.addEventListener('submit', handleSubmit);
 appRoot.addEventListener('input', handleInput);
 
+window.addEventListener('online', handleConnectivityChange);
+window.addEventListener('offline', handleConnectivityChange);
+
+let appDbPromise = null;
+
+init();
+
+function getAppDb() {
+  if (!window.indexedDB || typeof window.indexedDB.open !== 'function') {
+    return Promise.resolve(null);
+  }
+
+  if (!appDbPromise) {
+    appDbPromise = new Promise((resolve, reject) => {
+      const request = window.indexedDB.open(APP_DB_NAME, APP_DB_VERSION);
+
+      request.onupgradeneeded = () => {
+        const db = request.result;
+
+        if (!db.objectStoreNames.contains('kv')) {
+          db.createObjectStore('kv', { keyPath: 'key' });
+        }
+
+        if (!db.objectStoreNames.contains('outbox')) {
+          db.createObjectStore('outbox', { keyPath: 'id' });
+        }
+      };
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  return appDbPromise;
+}
+
+async function dbPut(storeName, value) {
+  const db = await getAppDb();
+  if (!db) {
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbGet(storeName, key) {
+  const db = await getAppDb();
+  if (!db) {
+    return null;
+  }
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const request = tx.objectStore(storeName).get(key);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function dbGetAll(storeName) {
+  const db = await getAppDb();
+  if (!db) {
+    return [];
+  }
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const request = tx.objectStore(storeName).getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function dbDelete(storeName, key) {
+  const db = await getAppDb();
+  if (!db) {
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function bufferToBase64(value) {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+  let binary = '';
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return window.btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const binary = window.atob(value);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+async function exportPublicKeyString(key) {
+  const jwk = await window.crypto.subtle.exportKey('jwk', key);
+  return JSON.stringify(jwk);
+}
+
+async function importPublicKeyString(value) {
+  const jwk = typeof value === 'string' ? JSON.parse(value) : value;
+  return window.crypto.subtle.importKey(
+    'jwk',
+    jwk,
+    {
+      name: 'RSA-OAEP',
+      hash: 'SHA-256',
+    },
+    true,
+    ['encrypt'],
+  );
+}
+
+async function importPrivateKeyString(value) {
+  const jwk = typeof value === 'string' ? JSON.parse(value) : value;
+  return window.crypto.subtle.importKey(
+    'jwk',
+    jwk,
+    {
+      name: 'RSA-OAEP',
+      hash: 'SHA-256',
+    },
+    true,
+    ['decrypt'],
+  );
+}
+
+async function ensureE2EESetup() {
+  if (state.dataSource !== 'api' || !state.token || !state.e2ee.supported || !state.user?.id) {
+    return;
+  }
+
+  const storedKey = await dbGet('kv', `e2ee-private:${state.user.id}`);
+  if (storedKey?.value?.privateKey && state.user.encryptionEnabled) {
+    state.e2ee.privateKey = await importPrivateKeyString(storedKey.value.privateKey);
+    state.e2ee.publicKey = storedKey.value.publicKey || state.user.encryptionPublicKey || '';
+    state.e2ee.keyVersion = storedKey.value.keyVersion || state.user.encryptionKeyVersion || 1;
+    state.e2ee.ready = true;
+    return;
+  }
+
+  const keyPair = await window.crypto.subtle.generateKey(
+    {
+      name: 'RSA-OAEP',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256',
+    },
+    true,
+    ['encrypt', 'decrypt'],
+  );
+  const publicKey = await exportPublicKeyString(keyPair.publicKey);
+  const privateKey = JSON.stringify(await window.crypto.subtle.exportKey('jwk', keyPair.privateKey));
+
+  await apiFetch('/api/v1/users/me/encryption-key', {
+    method: 'PUT',
+    headers: {},
+    body: JSON.stringify({
+      publicKey,
+      keyVersion: 1,
+    }),
+  });
+
+  await dbPut('kv', {
+    key: `e2ee-private:${state.user.id}`,
+    value: {
+      publicKey,
+      privateKey,
+      keyVersion: 1,
+    },
+  });
+
+  state.user.encryptionEnabled = true;
+  state.user.encryptionPublicKey = publicKey;
+  state.user.encryptionKeyVersion = 1;
+  state.e2ee.privateKey = keyPair.privateKey;
+  state.e2ee.publicKey = publicKey;
+  state.e2ee.keyVersion = 1;
+  state.e2ee.ready = true;
+}
+
+async function fetchPartnerEncryptionKey(userId) {
+  if (!userId) {
+    return null;
+  }
+
+  if (state.e2ee.partnerKeys[userId]) {
+    return state.e2ee.partnerKeys[userId];
+  }
+
+  const response = await apiFetch(`/api/v1/users/${userId}/encryption-key`);
+  if (!response.data?.publicKey) {
+    return null;
+  }
+
+  const key = {
+    publicKey: response.data.publicKey,
+    keyVersion: response.data.keyVersion || 1,
+  };
+  state.e2ee.partnerKeys[userId] = key;
+  return key;
+}
+
+async function encryptPrivateMessage(chat, text) {
+  if (!state.e2ee.ready || !chat?.partnerId) {
+    return null;
+  }
+
+  const partnerKeyInfo = await fetchPartnerEncryptionKey(chat.partnerId);
+  if (!partnerKeyInfo?.publicKey) {
+    return null;
+  }
+
+  const recipientKey = await importPublicKeyString(partnerKeyInfo.publicKey);
+  const selfPublicKey = await importPublicKeyString(state.e2ee.publicKey);
+  const symmetricKey = await window.crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt'],
+  );
+  const rawKey = await window.crypto.subtle.exportKey('raw', symmetricKey);
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encodedText = new TextEncoder().encode(text);
+  const ciphertext = await window.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    symmetricKey,
+    encodedText,
+  );
+
+  const [selfWrapped, recipientWrapped] = await Promise.all([
+    window.crypto.subtle.encrypt({ name: 'RSA-OAEP' }, selfPublicKey, rawKey),
+    window.crypto.subtle.encrypt({ name: 'RSA-OAEP' }, recipientKey, rawKey),
+  ]);
+
+  return {
+    isEncrypted: true,
+    ciphertext: bufferToBase64(ciphertext),
+    ciphertextIv: bufferToBase64(iv),
+    encryptionVersion: 1,
+    encryptedKeys: [
+      { userId: state.user.id, keyCiphertext: bufferToBase64(selfWrapped) },
+      { userId: chat.partnerId, keyCiphertext: bufferToBase64(recipientWrapped) },
+    ],
+  };
+}
+
+async function decryptMessageContent(message) {
+  if (!message?.isEncrypted || !state.e2ee.privateKey || !state.user?.id) {
+    return message;
+  }
+
+  const encryptedKey = (message.encryptedKeys || []).find((item) => String(item.userId) === String(state.user.id));
+  if (!encryptedKey?.keyCiphertext) {
+    return { ...message, decryptedText: 'Encrypted message' };
+  }
+
+  try {
+    const rawKey = await window.crypto.subtle.decrypt(
+      { name: 'RSA-OAEP' },
+      state.e2ee.privateKey,
+      base64ToBytes(encryptedKey.keyCiphertext),
+    );
+    const symmetricKey = await window.crypto.subtle.importKey(
+      'raw',
+      rawKey,
+      { name: 'AES-GCM' },
+      false,
+      ['decrypt'],
+    );
+    const plaintext = await window.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: base64ToBytes(message.ciphertextIv) },
+      symmetricKey,
+      base64ToBytes(message.ciphertext),
+    );
+
+    return {
+      ...message,
+      decryptedText: new TextDecoder().decode(plaintext),
+    };
+  } catch (error) {
+    return {
+      ...message,
+      decryptedText: 'Encrypted message',
+      decryptionFailed: true,
+    };
+  }
+}
+
+async function decryptChatMessages(chatId) {
+  const messages = state.messagesByChat[chatId] || [];
+  if (!messages.some((item) => item.isEncrypted)) {
+    return;
+  }
+
+  const decrypted = await Promise.all(messages.map((message) => decryptMessageContent(message)));
+  state.messagesByChat[chatId] = decrypted;
+  await persistChatMessagesCache(chatId);
+  render();
+}
+
 async function init() {
   state.theme = readTheme();
   applyTheme();
+  await hydratePendingOutbox();
   const stored = readSession();
 
   if (stored?.token) {
@@ -84,6 +411,235 @@ async function init() {
   state.isLoading = false;
   state.screen = 'auth';
   render();
+}
+
+function handleConnectivityChange() {
+  state.offline.isOnline = window.navigator?.onLine ?? true;
+
+  if (state.offline.isOnline) {
+    pushToast('Back online', 'Queued work will resume automatically.', 'success');
+    flushPendingOutbox();
+  } else {
+    pushToast('Offline mode', 'Recent chats stay available and new messages will queue locally.', 'info');
+  }
+
+  render();
+}
+
+function workspaceSnapshot() {
+  return {
+    user: state.user,
+    privacy: state.privacy,
+    chats: state.chats,
+    contacts: state.contacts,
+    requests: state.requests,
+    groups: state.groups,
+    notifications: state.notifications,
+    unreadNotificationCount: state.unreadNotificationCount,
+    filesHubItems: state.filesHub.items,
+    adminSummary: state.admin.summary,
+    selectedChatId: state.selectedChatId,
+    selectedContactId: state.selectedContactId,
+    selectedGroupId: state.selectedGroupId,
+    cachedAt: new Date().toISOString(),
+  };
+}
+
+async function persistWorkspaceCache() {
+  await dbPut('kv', {
+    key: 'workspace',
+    value: workspaceSnapshot(),
+  });
+}
+
+async function persistChatMessagesCache(chatId) {
+  await dbPut('kv', {
+    key: `messages:${chatId}`,
+    value: state.messagesByChat[chatId] || [],
+  });
+}
+
+async function loadCachedWorkspace() {
+  const workspace = await dbGet('kv', 'workspace');
+  if (!workspace?.value) {
+    return false;
+  }
+
+  const cached = workspace.value;
+  state.user = cached.user;
+  state.privacy = cached.privacy;
+  state.chats = cached.chats || [];
+  state.contacts = cached.contacts || [];
+  state.requests = cached.requests || { incoming: [], outgoing: [] };
+  state.groups = cached.groups || [];
+  state.notifications = cached.notifications || [];
+  state.unreadNotificationCount = cached.unreadNotificationCount || 0;
+  state.filesHub.items = cached.filesHubItems || [];
+  state.admin.summary = cached.adminSummary || null;
+  state.dataSource = 'api';
+  state.offline.usingCachedWorkspace = true;
+  state.selectedChatId = cached.selectedChatId || state.chats[0]?.id || null;
+  state.selectedContactId = cached.selectedContactId || state.contacts[0]?.id || null;
+  state.selectedGroupId = cached.selectedGroupId || state.groups[0]?.id || null;
+  state.messagesByChat = {};
+
+  if (state.selectedChatId) {
+    const cachedMessages = await dbGet('kv', `messages:${state.selectedChatId}`);
+    state.messagesByChat[state.selectedChatId] = cachedMessages?.value || [];
+  }
+
+  await hydratePendingOutbox();
+  return true;
+}
+
+function buildLocalPendingMessage(entry) {
+  return {
+    id: entry.localId,
+    clientMessageId: entry.clientMessageId,
+    chatId: entry.chatId,
+    senderId: state.user?.id || 'me',
+    senderName: state.user?.fullName || 'You',
+    text: entry.plaintext || entry.payload.text || '',
+    type: entry.payload.type || 'text',
+    mediaUrl: entry.previewUrl || entry.payload.mediaUrl || '',
+    thumbnailUrl: entry.payload.thumbnailUrl || '',
+    mimeType: entry.payload.mimeType || '',
+    fileName: entry.payload.fileName || '',
+    fileSize: Number(entry.payload.fileSize || 0),
+    duration: Number(entry.payload.duration || 0),
+    replyText: state.replyDraft?.text || '',
+    createdAt: entry.createdAt,
+    editedAt: null,
+    pinnedAt: null,
+    seenCount: 0,
+    deliveryState: entry.deliveryState || 'queued',
+    mine: true,
+  };
+}
+
+function upsertMessageForChat(chatId, message) {
+  const current = state.messagesByChat[chatId] || [];
+  const matchIndex = current.findIndex((item) => (
+    item.id === message.id
+      || (message.clientMessageId && item.clientMessageId && item.clientMessageId === message.clientMessageId)
+  ));
+
+  if (matchIndex >= 0) {
+    current[matchIndex] = { ...current[matchIndex], ...message };
+    state.messagesByChat[chatId] = [...current];
+    return;
+  }
+
+  state.messagesByChat[chatId] = [...current, message];
+}
+
+async function queueOutboundMessage(entry) {
+  await dbPut('outbox', entry);
+  state.offline.pendingCount += 1;
+  const localMessage = buildLocalPendingMessage(entry);
+  upsertMessageForChat(entry.chatId, localMessage);
+  syncFilesHubFromMessage(localMessage);
+  const chat = state.chats.find((item) => item.id === entry.chatId);
+  if (chat) {
+    chat.lastMessagePreview = localMessage.text || localMessage.fileName || 'Pending message';
+    chat.lastMessageAt = localMessage.createdAt;
+  }
+  await persistChatMessagesCache(entry.chatId);
+  await persistWorkspaceCache();
+  render();
+}
+
+async function hydratePendingOutbox() {
+  const entries = (await dbGetAll('outbox')).sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt));
+  state.offline.pendingCount = entries.length;
+
+  for (const entry of entries) {
+    if (!state.messagesByChat[entry.chatId]) {
+      const cachedMessages = await dbGet('kv', `messages:${entry.chatId}`);
+      state.messagesByChat[entry.chatId] = cachedMessages?.value || [];
+    }
+
+    const previewUrl = entry.fileBlob && !entry.previewUrl && typeof URL.createObjectURL === 'function'
+      ? URL.createObjectURL(entry.fileBlob)
+      : entry.previewUrl || '';
+    const hydratedEntry = previewUrl !== entry.previewUrl ? { ...entry, previewUrl } : entry;
+    upsertMessageForChat(entry.chatId, buildLocalPendingMessage(hydratedEntry));
+  }
+}
+
+async function flushPendingOutbox() {
+  if (state.dataSource !== 'api' || !state.token || !state.offline.isOnline || state.offline.isSyncing) {
+    return;
+  }
+
+  const entries = (await dbGetAll('outbox')).sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt));
+  if (!entries.length) {
+    state.offline.pendingCount = 0;
+    render();
+    return;
+  }
+
+  state.offline.isSyncing = true;
+  render();
+
+  for (const entry of entries) {
+    try {
+      upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: 'sending' }));
+      let payload = { ...entry.payload };
+
+      if (entry.fileBlob) {
+        const upload = await uploadChatMediaFile(entry.fileBlob);
+        payload = {
+          ...payload,
+          mediaUrl: upload.data?.url || payload.mediaUrl,
+          mimeType: upload.data?.mimeType || payload.mimeType,
+          fileName: upload.data?.fileName || payload.fileName,
+          fileSize: upload.data?.fileSize || payload.fileSize,
+        };
+      }
+
+      const response = await apiFetch('/api/v1/messages', {
+        method: 'POST',
+        headers: {},
+        body: JSON.stringify(payload),
+      });
+      const message = normalizeMessage(response.data);
+      upsertMessageForChat(entry.chatId, message);
+      syncFilesHubFromMessage(message);
+      await dbDelete('outbox', entry.id);
+      await persistChatMessagesCache(entry.chatId);
+    } catch (error) {
+      const nextState = error.status ? 'failed' : 'queued';
+      upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: nextState }));
+      if (!error.status) {
+        state.offline.isOnline = false;
+        break;
+      }
+    }
+  }
+
+  state.offline.pendingCount = (await dbGetAll('outbox')).length;
+  state.offline.isSyncing = false;
+  await persistWorkspaceCache();
+  render();
+}
+
+async function retryPendingMessage(localMessageId) {
+  const entries = await dbGetAll('outbox');
+  const entry = entries.find((item) => item.localId === localMessageId || item.id === localMessageId);
+  if (!entry) {
+    pushToast('Retry unavailable', 'This queued message could not be found locally.', 'error');
+    return;
+  }
+
+  await dbPut('outbox', {
+    ...entry,
+    deliveryState: 'queued',
+  });
+
+  upsertMessageForChat(entry.chatId, buildLocalPendingMessage({ ...entry, deliveryState: 'queued' }));
+  render();
+  await flushPendingOutbox();
 }
 
 function createDemoWorkspace() {
@@ -348,6 +904,23 @@ function createDemoWorkspace() {
         editedAt: null,
         seenCount: 0,
       },
+      {
+        id: 'message-4b',
+        chatId: 'chat-1',
+        senderId: 'contact-1',
+        senderName: 'Sara Nasser',
+        text: '',
+        type: 'image',
+        mediaUrl: 'data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"700\"><rect width=\"1200\" height=\"700\" fill=\"%23111827\"/><circle cx=\"250\" cy=\"180\" r=\"140\" fill=\"%233B82F6\" opacity=\"0.7\"/><circle cx=\"920\" cy=\"420\" r=\"190\" fill=\"%238B5CF6\" opacity=\"0.6\"/><text x=\"70\" y=\"620\" fill=\"white\" font-size=\"64\" font-family=\"Arial\">PulseChat concept board</text></svg>',
+        fileName: 'pulsechat-concept-board.svg',
+        mimeType: 'image/svg+xml',
+        fileSize: 32000,
+        createdAt: offsetMinutes(-4),
+        replyText: '',
+        mine: false,
+        editedAt: null,
+        seenCount: 0,
+      },
     ],
     'chat-2': [
       {
@@ -387,6 +960,23 @@ function createDemoWorkspace() {
         mine: true,
         editedAt: null,
         seenCount: 5,
+      },
+      {
+        id: 'message-8',
+        chatId: 'chat-3',
+        senderId: 'contact-3',
+        senderName: 'Laila Hatem',
+        text: '',
+        type: 'file',
+        mediaUrl: 'data:text/plain;charset=utf-8,Phase%202%20launch%20checklist%0A-%20Auth%20QA%0A-%20Socket%20pass%0A-%20UI%20handoff',
+        fileName: 'phase-2-launch-checklist.txt',
+        mimeType: 'text/plain',
+        fileSize: 2048,
+        createdAt: offsetMinutes(-22),
+        replyText: '',
+        mine: false,
+        editedAt: null,
+        seenCount: 3,
       },
     ],
   };
@@ -520,8 +1110,10 @@ function connectLiveSocket() {
 
   socket.on('connect', () => {
     state.liveConnectionState = 'connected';
+    state.offline.isOnline = true;
     joinSelectedChatRoom();
     syncChatReceipts(state.selectedChatId);
+    flushPendingOutbox();
     render();
   });
 
@@ -567,14 +1159,23 @@ function connectLiveSocket() {
     const message = normalizeMessage(payload);
     const chatId = message.chatId;
     const current = state.messagesByChat[chatId] || [];
-    if (!current.some((item) => item.id === message.id)) {
+    const existingIndex = current.findIndex((item) => (
+      item.id === message.id
+        || (message.clientMessageId && item.clientMessageId && item.clientMessageId === message.clientMessageId)
+    ));
+    if (existingIndex >= 0) {
+      current[existingIndex] = { ...current[existingIndex], ...message, deliveryState: 'sent' };
+      state.messagesByChat[chatId] = [...current];
+    } else {
       state.messagesByChat[chatId] = [...current, message];
     }
     syncFilesHubFromMessage(message);
 
     const chat = state.chats.find((item) => item.id === chatId);
     if (chat) {
-      chat.lastMessagePreview = message.text || message.fileName || capitalize(message.type || 'message');
+      chat.lastMessagePreview = message.isEncrypted
+        ? (message.decryptedText || 'Encrypted message')
+        : (message.text || message.fileName || capitalize(message.type || 'message'));
       chat.lastMessageAt = message.createdAt;
       if (!message.mine && state.selectedChatId !== chatId) {
         chat.unreadCount = Number(chat.unreadCount || 0) + 1;
@@ -588,7 +1189,16 @@ function connectLiveSocket() {
       }
     }
 
+    persistChatMessagesCache(chatId);
     render();
+
+    if (message.isEncrypted) {
+      decryptMessageContent(message).then((decryptedMessage) => {
+        upsertMessageForChat(chatId, decryptedMessage);
+        persistChatMessagesCache(chatId);
+        render();
+      });
+    }
   });
 
   socket.on('message:updated', (payload) => {
@@ -597,12 +1207,22 @@ function connectLiveSocket() {
       item.id === message.id ? { ...item, ...message } : item
     ));
     syncFilesHubFromMessage(message);
+    persistChatMessagesCache(message.chatId);
     render();
+
+    if (message.isEncrypted) {
+      decryptMessageContent(message).then((decryptedMessage) => {
+        upsertMessageForChat(message.chatId, decryptedMessage);
+        persistChatMessagesCache(message.chatId);
+        render();
+      });
+    }
   });
 
   socket.on('message:deleted', ({ chatId, messageId }) => {
     state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).filter((item) => item.id !== String(messageId));
     state.filesHub.items = state.filesHub.items.filter((item) => item.messageId !== String(messageId));
+    persistChatMessagesCache(chatId);
     render();
   });
 
@@ -741,6 +1361,7 @@ async function loadLiveWorkspace() {
     state.typingByChat = {};
     discardVoiceDraft({ silent: true });
     resetVoiceRecorderState();
+    await ensureE2EESetup().catch(() => null);
     state.selectedChatId = state.chats[0]?.id || null;
     state.selectedContactId = state.contacts[0]?.id || null;
     state.selectedGroupId = state.groups[0]?.id || null;
@@ -750,6 +1371,10 @@ async function loadLiveWorkspace() {
     }
 
     await loadFilesHub({ silent: true });
+    await hydratePendingOutbox();
+    state.offline.usingCachedWorkspace = false;
+    state.offline.isOnline = window.navigator?.onLine ?? true;
+    await persistWorkspaceCache();
 
     connectLiveSocket();
 
@@ -781,6 +1406,15 @@ async function loadLiveWorkspace() {
       clearSession();
       state.token = null;
       state.refreshToken = null;
+    } else if (await loadCachedWorkspace()) {
+      state.isLoading = false;
+      state.offline.isOnline = false;
+      pushToast(
+        'Offline workspace',
+        error.message || 'Cached chats and pending messages are available until the connection returns.',
+        'info',
+      );
+      return true;
     }
 
     syncDemoState();
@@ -811,6 +1445,9 @@ function normalizeUser(user) {
     lastSeen: user.lastSeen || null,
     profileImage: user.profileImage || '',
     role: user.role || 'user',
+    encryptionEnabled: Boolean(user.encryptionEnabled),
+    encryptionPublicKey: user.encryptionPublicKey || '',
+    encryptionKeyVersion: Number(user.encryptionKeyVersion || 0),
   };
 }
 
@@ -850,6 +1487,9 @@ function normalizeChat(chat, currentUser) {
     partnerStatus: partner?.statusMessage || '',
     avatarText: initials(title),
     avatarImage: partner?.profileImage || '',
+    partnerPublicKey: partner?.encryptionPublicKey || '',
+    partnerKeyVersion: Number(partner?.encryptionKeyVersion || 0),
+    e2eeCapable: Boolean(!isGroup && partner?.encryptionEnabled),
     unreadCount: Number(chat.unreadCount || 0),
     pinned: Boolean(chat.participantSettings?.pinnedAt || chat.pinned),
     muted: Boolean(chat.participantSettings?.mutedUntil || chat.muted),
@@ -956,6 +1596,11 @@ function normalizeMessage(item) {
     fileName: item.fileName || '',
     fileSize: Number(item.fileSize || 0),
     duration: Number(item.duration || 0),
+    isEncrypted: Boolean(item.isEncrypted),
+    ciphertext: item.ciphertext || '',
+    ciphertextIv: item.ciphertextIv || '',
+    encryptionVersion: Number(item.encryptionVersion || 0),
+    encryptedKeys: Array.isArray(item.encryptedKeys) ? item.encryptedKeys : [],
     replyText: item.replyToMessageId?.text || '',
     createdAt: item.createdAt,
     editedAt: item.editedAt || null,
@@ -1081,15 +1726,31 @@ async function loadChatMessages(chatId) {
   try {
     const messagesRes = await apiFetch(`/api/v1/messages/chat/${chatId}?limit=50`);
     state.messagesByChat[chatId] = (messagesRes.data || []).map(normalizeMessage).reverse();
+    await persistChatMessagesCache(chatId);
+    await decryptChatMessages(chatId);
     const chat = state.chats.find((item) => item.id === chatId);
     if (chat) {
       chat.unreadCount = 0;
+      if (chat.type === 'private' && chat.partnerId) {
+        const partnerKey = await fetchPartnerEncryptionKey(chat.partnerId).catch(() => null);
+        if (partnerKey?.publicKey) {
+          chat.partnerPublicKey = partnerKey.publicKey;
+          chat.partnerKeyVersion = partnerKey.keyVersion || 1;
+          chat.e2eeCapable = true;
+        }
+      }
     }
     joinSelectedChatRoom(chatId);
     syncChatReceipts(chatId);
   } catch (error) {
-    pushToast('Messages unavailable', error.message, 'info');
-    state.messagesByChat[chatId] = [];
+    const cachedMessages = await dbGet('kv', `messages:${chatId}`);
+    if (cachedMessages?.value?.length) {
+      state.messagesByChat[chatId] = cachedMessages.value;
+      pushToast('Offline messages', 'Showing the most recent cached conversation history.', 'info');
+    } else {
+      pushToast('Messages unavailable', error.message, 'info');
+      state.messagesByChat[chatId] = [];
+    }
   }
 
   render();
@@ -1362,6 +2023,30 @@ async function sendVoiceDraft(chatId) {
     return;
   }
 
+  const clientMessageId = crypto.randomUUID();
+  const queueEntry = {
+    id: clientMessageId,
+    localId: `local-${clientMessageId}`,
+    clientMessageId,
+    chatId,
+    plaintext: text,
+    createdAt: new Date().toISOString(),
+    deliveryState: 'queued',
+    previewUrl: state.voiceDraft.previewUrl,
+    fileBlob: state.voiceDraft.file,
+    payload: {
+      chatId,
+      clientMessageId,
+      type: 'voice',
+      text: '',
+      mimeType: state.voiceDraft.mimeType,
+      fileName: state.voiceDraft.fileName,
+      fileSize: state.voiceDraft.fileSize,
+      duration: state.voiceDraft.duration,
+      replyToMessageId: state.replyDraft?.id || null,
+    },
+  };
+
   if (state.dataSource === 'demo') {
     const message = {
       id: `voice-${Date.now()}`,
@@ -1396,6 +2081,14 @@ async function sendVoiceDraft(chatId) {
     return;
   }
 
+  if (!state.offline.isOnline) {
+    await queueOutboundMessage(queueEntry);
+    state.replyDraft = null;
+    state.voiceDraft = null;
+    pushToast('Voice queued', 'The voice message will upload automatically when the connection returns.', 'info');
+    return;
+  }
+
   try {
     state.isSubmitting = true;
     render();
@@ -1405,6 +2098,7 @@ async function sendVoiceDraft(chatId) {
       headers: {},
       body: JSON.stringify({
         chatId,
+        clientMessageId,
         type: 'voice',
         text: '',
         mediaUrl: upload.data?.url,
@@ -1428,9 +2122,18 @@ async function sendVoiceDraft(chatId) {
     }
     discardVoiceDraft({ silent: true });
     state.replyDraft = null;
+    await persistChatMessagesCache(chatId);
+    await persistWorkspaceCache();
     pushToast('Voice sent', 'Your voice message is now part of the conversation.', 'success');
   } catch (error) {
-    pushToast('Voice send failed', error.message, 'error');
+    if (!error.status) {
+      await queueOutboundMessage(queueEntry);
+      state.replyDraft = null;
+      state.voiceDraft = null;
+      pushToast('Voice queued', 'The network dropped, so the voice note was queued locally.', 'info');
+    } else {
+      pushToast('Voice send failed', error.message, 'error');
+    }
   } finally {
     state.isSubmitting = false;
     render();
@@ -1664,6 +2367,7 @@ function renderWorkspace() {
           <button class="ghost-button" type="button" data-action="logout">Log out</button>
         </div>
       </header>
+      ${renderConnectionBanner()}
       <div class="workspace-grid workspace-grid-quad">
         <aside class="sidebar side-panel">
           <div class="profile-card">
@@ -1713,6 +2417,32 @@ function renderWorkspace() {
       ${renderMobileDock(unreadCount, pendingCount)}
       ${renderModal()}
       ${renderToasts()}
+    </div>
+  `;
+}
+
+function renderConnectionBanner() {
+  if (state.dataSource === 'demo') {
+    return '';
+  }
+
+  if (state.offline.isOnline && !state.offline.usingCachedWorkspace && !state.offline.pendingCount && !state.offline.isSyncing) {
+    return '';
+  }
+
+  const tone = !state.offline.isOnline ? 'warning' : state.offline.pendingCount ? 'info' : 'success';
+  const message = !state.offline.isOnline
+    ? 'You are offline. Recent conversations stay available and new messages will queue locally.'
+    : state.offline.isSyncing
+      ? 'Connection restored. Queued messages are syncing now.'
+      : state.offline.pendingCount
+        ? `${state.offline.pendingCount} queued message${state.offline.pendingCount === 1 ? '' : 's'} waiting to sync.`
+        : 'You are back online and the workspace is fully synced.';
+
+  return `
+    <div class="connection-banner ${tone}">
+      <strong>${!state.offline.isOnline ? 'Offline mode' : 'Sync status'}</strong>
+      <span>${message}</span>
     </div>
   `;
 }
@@ -1944,9 +2674,12 @@ function getChatPreviewText(chat) {
   }
 
   const latestMessage = (state.messagesByChat[chat.id] || []).slice(-1)[0];
-  if (latestMessage?.mine && latestMessage.text) {
+  const latestText = latestMessage?.isEncrypted
+    ? (latestMessage.decryptedText || 'Encrypted message')
+    : latestMessage?.text;
+  if (latestMessage?.mine && latestText) {
     return {
-      text: `You: ${latestMessage.text}`,
+      text: `You: ${latestText}`,
       isTyping: false,
     };
   }
@@ -2046,6 +2779,7 @@ function renderChatsPanel() {
   const selectedChat = getSelectedChat();
   const messages = selectedChat ? state.messagesByChat[selectedChat.id] || [] : [];
   const typingText = selectedChat ? state.typingByChat[selectedChat.id] : '';
+  const e2eeActive = isE2EEActiveForChat(selectedChat);
 
   if (!selectedChat) {
     return `
@@ -2092,6 +2826,7 @@ function renderChatsPanel() {
           </div>
         </div>
         <div class="chat-header-actions">
+          ${e2eeActive ? '<span class="tag">Encrypted</span>' : ''}
           ${selectedChat.type === 'private' ? '<span class="tag">Private space</span>' : ''}
           <button class="ghost-button icon-button" type="button" data-action="composer-emoji" title="Emoji">☺</button>
           <button class="ghost-button icon-button" type="button" data-action="composer-attach" title="Attach">+</button>
@@ -2286,15 +3021,18 @@ function fileTypeIcon(type) {
 function renderMessage(message) {
   const isImage = isImageAttachment(message);
   const isVoice = message.type === 'voice';
+  const isPending = ['queued', 'sending', 'failed'].includes(message.deliveryState);
+  const visibleText = message.isEncrypted ? (message.decryptedText || 'Encrypted message') : message.text;
 
   return `
     <article class="message-row ${message.mine ? 'mine' : ''}">
       ${message.mine ? '' : renderAvatar(message.senderName, '', 'small')}
-      <div class="message-bubble ${message.mine ? 'sent' : 'received'}">
+      <div class="message-bubble ${message.mine ? 'sent' : 'received'} ${isPending ? `is-${message.deliveryState}` : ''}">
         ${message.replyText ? `<div class="reply-chip">${escapeHtml(message.replyText)}</div>` : ''}
         ${message.pinnedAt ? '<div class="reply-chip">Pinned message</div>' : ''}
+        ${message.isEncrypted ? '<div class="reply-chip">End-to-end encrypted</div>' : ''}
         ${message.mine ? '' : `<strong>${escapeHtml(message.senderName)}</strong>`}
-        ${message.text ? `<p class="message-text">${escapeHtml(message.text)}</p>` : ''}
+        ${visibleText ? `<p class="message-text">${escapeHtml(visibleText)}</p>` : ''}
         ${message.mediaUrl
           ? isVoice
             ? `
@@ -2313,11 +3051,14 @@ function renderMessage(message) {
         <div class="request-actions message-actions-row">
           <button class="chip-button" type="button" data-action="reply-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reply</button>
           <button class="chip-button" type="button" data-action="react-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reaction</button>
+          ${message.deliveryState === 'failed'
+            ? `<button class="chip-button" type="button" data-action="retry-message" data-message-id="${message.id}" style="padding: 8px 12px;">Retry</button>`
+            : ''}
         </div>
         <div class="message-meta">
           <span>${formatTime(message.createdAt)}</span>
           ${message.editedAt ? '<span>edited</span>' : ''}
-          ${message.mine ? `<span class="message-status">${message.seenCount ? `✓✓ seen by ${message.seenCount}` : '✓ sent'}</span>` : ''}
+          ${message.mine ? `<span class="message-status">${message.deliveryState === 'queued' ? 'Queued' : message.deliveryState === 'sending' ? 'Sending…' : message.deliveryState === 'failed' ? 'Failed' : message.seenCount ? `✓✓ seen by ${message.seenCount}` : '✓ sent'}</span>` : ''}
         </div>
       </div>
     </article>
@@ -3125,6 +3866,11 @@ async function handleClick(event) {
     return;
   }
 
+  if (action === 'retry-message') {
+    await retryPendingMessage(target.dataset.messageId);
+    return;
+  }
+
   if (action === 'open-group-invite') {
     await openGroupInvite(target.dataset.groupId);
     return;
@@ -3383,6 +4129,25 @@ async function handleMessageSubmit(formData, form) {
     return;
   }
 
+  const selectedChat = state.chats.find((item) => item.id === chatId);
+  const clientMessageId = crypto.randomUUID();
+  const encryptedPayload = selectedChat?.type === 'private' ? await encryptPrivateMessage(selectedChat, text) : null;
+  const queueEntry = {
+    id: clientMessageId,
+    localId: `local-${clientMessageId}`,
+    clientMessageId,
+    chatId,
+    createdAt: new Date().toISOString(),
+    deliveryState: 'queued',
+    payload: {
+      chatId,
+      clientMessageId,
+      text: encryptedPayload ? '' : text,
+      ...encryptedPayload,
+      replyToMessageId: state.replyDraft?.id || null,
+    },
+  };
+
   if (state.dataSource === 'demo') {
     const message = {
       id: `message-${Date.now()}`,
@@ -3409,33 +4174,49 @@ async function handleMessageSubmit(formData, form) {
     return;
   }
 
+  if (!state.offline.isOnline) {
+    await queueOutboundMessage(queueEntry);
+    state.replyDraft = null;
+    form.reset();
+    pushToast('Message queued', 'The message will send automatically when the connection returns.', 'info');
+    return;
+  }
+
   try {
     state.socket?.emit('message:stop-typing', { chatId });
     const response = await apiFetch('/api/v1/messages', {
       method: 'POST',
       headers: {},
-      body: JSON.stringify({
-        chatId,
-        text,
-        replyToMessageId: state.replyDraft?.id || null,
-      }),
+      body: JSON.stringify(queueEntry.payload),
     });
-    const message = normalizeMessage(response.data);
+    let message = normalizeMessage(response.data);
+    if (message.isEncrypted) {
+      message = await decryptMessageContent(message);
+    }
     const existingMessages = state.messagesByChat[chatId] || [];
     state.messagesByChat[chatId] = existingMessages.some((item) => item.id === message.id)
       ? existingMessages.map((item) => (item.id === message.id ? message : item))
       : [...existingMessages, message];
     const chat = state.chats.find((item) => item.id === chatId);
     if (chat) {
-      chat.lastMessagePreview = message.text;
+      chat.lastMessagePreview = encryptedPayload ? text : message.text;
       chat.lastMessageAt = message.createdAt;
     }
     state.replyDraft = null;
     form.reset();
+    await persistChatMessagesCache(chatId);
+    await persistWorkspaceCache();
     pushToast('Message sent', 'The conversation was updated against the live API.', 'success');
     render();
   } catch (error) {
-    pushToast('Send failed', error.message, 'error');
+    if (!error.status) {
+      await queueOutboundMessage(queueEntry);
+      state.replyDraft = null;
+      form.reset();
+      pushToast('Message queued', 'The network dropped, so the message was safely queued locally.', 'info');
+    } else {
+      pushToast('Send failed', error.message, 'error');
+    }
     render();
   }
 }
@@ -3823,6 +4604,15 @@ function getSelectedContact() {
 
 function getSelectedGroup() {
   return state.groups.find((item) => item.id === state.selectedGroupId) || null;
+}
+
+function isE2EEActiveForChat(chat) {
+  return Boolean(
+    chat
+      && chat.type === 'private'
+      && state.e2ee.ready
+      && (chat.e2eeCapable || chat.partnerPublicKey),
+  );
 }
 
 function pushToast(title, message, type = 'info') {

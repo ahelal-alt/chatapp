@@ -79,6 +79,18 @@ const userSchema = new mongoose.Schema(
       enum: ['user', 'admin'],
       default: 'user',
     },
+    encryptionPublicKey: {
+      type: String,
+      default: '',
+    },
+    encryptionKeyVersion: {
+      type: Number,
+      default: 0,
+    },
+    encryptionEnabled: {
+      type: Boolean,
+      default: false,
+    },
     isActive: {
       type: Boolean,
       default: true,

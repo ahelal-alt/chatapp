@@ -15,6 +15,21 @@ const seenBySchema = new mongoose.Schema(
   { _id: false },
 );
 
+const encryptedKeySchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+    keyCiphertext: {
+      type: String,
+      required: true,
+    },
+  },
+  { _id: false },
+);
+
 const messageSchema = new mongoose.Schema(
   {
     chatId: {
@@ -28,6 +43,11 @@ const messageSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
       index: true,
+    },
+    clientMessageId: {
+      type: String,
+      default: '',
+      trim: true,
     },
     type: {
       type: String,
@@ -61,6 +81,26 @@ const messageSchema = new mongoose.Schema(
     duration: {
       type: Number,
       default: 0,
+    },
+    isEncrypted: {
+      type: Boolean,
+      default: false,
+    },
+    ciphertext: {
+      type: String,
+      default: '',
+    },
+    ciphertextIv: {
+      type: String,
+      default: '',
+    },
+    encryptionVersion: {
+      type: Number,
+      default: 0,
+    },
+    encryptedKeys: {
+      type: [encryptedKeySchema],
+      default: [],
     },
     latitude: {
       type: Number,
@@ -127,5 +167,12 @@ const messageSchema = new mongoose.Schema(
 
 messageSchema.index({ chatId: 1, createdAt: -1 });
 messageSchema.index({ senderId: 1, createdAt: -1 });
+messageSchema.index(
+  { senderId: 1, clientMessageId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { clientMessageId: { $exists: true, $ne: '' } },
+  },
+);
 
 module.exports = mongoose.model('Message', messageSchema);

@@ -37,6 +37,10 @@ function buildChatPreview(message) {
     return '';
   }
 
+  if (message.isEncrypted) {
+    return 'Encrypted message';
+  }
+
   if (message.type === 'location') {
     return 'Location';
   }
@@ -155,7 +159,7 @@ async function listChats(userId, query) {
       .skip(skip)
       .limit(limit)
       .populate('lastMessageId')
-      .populate('memberIds', 'fullName username profileImage isOnline lastSeen'),
+      .populate('memberIds', 'fullName username profileImage isOnline lastSeen encryptionPublicKey encryptionKeyVersion encryptionEnabled'),
     Chat.countDocuments(criteria),
   ]);
 
@@ -178,7 +182,7 @@ async function listChats(userId, query) {
 
 async function getChatDetails(userId, chatId) {
   const chat = await ensureChatMember(chatId, userId);
-  return chat.populate('memberIds', 'fullName username profileImage isOnline lastSeen');
+  return chat.populate('memberIds', 'fullName username profileImage isOnline lastSeen encryptionPublicKey encryptionKeyVersion encryptionEnabled');
 }
 
 async function setChatFlag(userId, chatId, updates) {

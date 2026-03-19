@@ -32,6 +32,16 @@ const getMutualContacts = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Mutual contacts fetched successfully', users));
 });
 
+const saveMyEncryptionKey = asyncHandler(async (req, res) => {
+  const result = await userService.saveMyEncryptionKey(req.user._id, req.body);
+  res.json(new ApiResponse('Encryption key saved successfully', result));
+});
+
+const getUserEncryptionKey = asyncHandler(async (req, res) => {
+  const result = await userService.getUserEncryptionKey(req.user._id, req.params.userId);
+  res.json(new ApiResponse('Encryption key fetched successfully', result));
+});
+
 module.exports = {
   getMe,
   updateMe,
@@ -39,5 +49,6 @@ module.exports = {
   getProfileById,
   searchUsers,
   getMutualContacts,
+  saveMyEncryptionKey,
+  getUserEncryptionKey,
 };
-
