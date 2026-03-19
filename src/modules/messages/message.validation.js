@@ -4,7 +4,12 @@ const { isValidUrlOrUploadPath } = require('../../utils/validation');
 const sendMessageValidation = [
   body('chatId').isMongoId().withMessage('chatId is required'),
   body('type').optional().isIn(['text', 'image', 'video', 'audio', 'file', 'voice', 'location']),
+  body('clientMessageId').optional().isString().isLength({ min: 1, max: 120 }),
   body('text').optional().isString(),
+  body('mimeType').optional().isString().isLength({ min: 1, max: 120 }),
+  body('fileName').optional().isString().isLength({ min: 1, max: 255 }),
+  body('fileSize').optional().isInt({ min: 0, max: 1024 * 1024 * 100 }),
+  body('duration').optional().isFloat({ min: 0, max: 60 * 60 * 4 }),
   body('mediaUrl')
     .optional()
     .custom((value) => isValidUrlOrUploadPath(value))
@@ -21,6 +26,17 @@ const sendMessageValidation = [
 
 const chatMessageListValidation = [
   param('chatId').isMongoId().withMessage('Invalid chat id'),
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 100 }),
+];
+
+const sharedFilesValidation = [
+  query('kind').optional().isIn(['all', 'image', 'video', 'audio', 'document', 'other']),
+  query('chatId').optional().isMongoId().withMessage('Invalid chat id'),
+  query('senderId').optional().isMongoId().withMessage('Invalid sender id'),
+  query('q').optional().trim().isLength({ min: 1, max: 80 }),
+  query('from').optional().isISO8601().withMessage('from must be a valid date'),
+  query('to').optional().isISO8601().withMessage('to must be a valid date'),
   query('page').optional().isInt({ min: 1 }),
   query('limit').optional().isInt({ min: 1, max: 100 }),
 ];
@@ -52,6 +68,7 @@ const reactionValidation = [
 module.exports = {
   sendMessageValidation,
   chatMessageListValidation,
+  sharedFilesValidation,
   messageIdValidation,
   messageSearchValidation,
   editMessageValidation,

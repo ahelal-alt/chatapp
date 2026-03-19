@@ -46,6 +46,11 @@ const chatMediaMimeTypes = [
   'audio/mpeg',
   'audio/mp4',
   'audio/webm',
+  'audio/ogg',
+  'audio/wav',
+  'audio/x-wav',
+  'audio/x-m4a',
+  'audio/aac',
   'application/pdf',
   'application/zip',
 ];

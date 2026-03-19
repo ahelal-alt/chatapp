@@ -22,6 +22,11 @@ const listPinnedMessages = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Pinned messages fetched successfully', result.items, result.meta));
 });
 
+const listSharedFiles = asyncHandler(async (req, res) => {
+  const result = await service.listSharedFiles(req.user._id, req.query);
+  res.json(new ApiResponse('Shared files fetched successfully', result.items, result.meta));
+});
+
 const getMessage = asyncHandler(async (req, res) => {
   const message = await service.getMessageById(req.user._id, req.params.messageId);
   res.json(new ApiResponse('Message fetched successfully', message));
@@ -87,6 +92,7 @@ module.exports = {
   listMessages,
   searchMessages,
   listPinnedMessages,
+  listSharedFiles,
   getMessage,
   editMessage,
   pinMessage,

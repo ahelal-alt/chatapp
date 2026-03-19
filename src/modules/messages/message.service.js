@@ -1,5 +1,6 @@
 const Message = require('./message.model');
 const Reaction = require('./reaction.model');
+const Chat = require('../chats/chat.model');
 const Group = require('../groups/group.model');
 const GroupMember = require('../groups/groupMember.model');
 const ApiError = require('../../utils/ApiError');
@@ -22,6 +23,27 @@ function hasMessagePayload(payload) {
       || payload.mediaUrl
       || (payload.latitude !== undefined && payload.longitude !== undefined),
   );
+}
+
+function buildMediaKind(message) {
+  if (message.type === 'image' || message.mimeType?.startsWith('image/')) {
+    return 'image';
+  }
+  if (message.type === 'video' || message.mimeType?.startsWith('video/')) {
+    return 'video';
+  }
+  if (message.type === 'voice' || message.type === 'audio' || message.mimeType?.startsWith('audio/')) {
+    return 'audio';
+  }
+  if (message.mimeType === 'application/pdf'
+    || message.mimeType?.includes('document')
+    || message.mimeType?.includes('sheet')
+    || message.mimeType?.includes('presentation')
+    || message.mimeType?.startsWith('text/')) {
+    return 'document';
+  }
+
+  return 'other';
 }
 
 async function assertCanSendToChat(chat, senderId) {
@@ -224,6 +246,105 @@ async function listPinnedMessages(userId, chatId, query) {
 
   return {
     items,
+    meta: buildPaginationMeta({ page, limit, total }),
+  };
+}
+
+async function listSharedFiles(userId, query) {
+  const { page, limit, skip } = getPagination(query);
+  const availableChats = await Chat.find({ memberIds: userId }).select('_id').lean();
+  const allowedChatIds = availableChats.map((chat) => chat._id);
+
+  if (!allowedChatIds.length) {
+    return {
+      items: [],
+      meta: buildPaginationMeta({ page, limit, total: 0 }),
+    };
+  }
+
+  const criteria = {
+    chatId: { $in: allowedChatIds },
+    deletedForEveryone: false,
+    deletedForUsers: { $ne: userId },
+    mediaUrl: { $nin: ['', null] },
+    type: { $in: ['image', 'video', 'audio', 'file', 'voice'] },
+  };
+
+  if (query.chatId) {
+    await ensureChatMember(query.chatId, userId);
+    criteria.chatId = query.chatId;
+  }
+
+  if (query.senderId) {
+    criteria.senderId = query.senderId;
+  }
+
+  if (query.kind && query.kind !== 'all') {
+    if (query.kind === 'document') {
+      criteria.$or = [
+        { mimeType: /application\/pdf/i },
+        { mimeType: /document/i },
+        { mimeType: /sheet/i },
+        { mimeType: /presentation/i },
+        { mimeType: /text\//i },
+      ];
+    } else if (query.kind === 'other') {
+      criteria.$nor = [
+        { type: 'image' },
+        { type: 'video' },
+        { type: 'audio' },
+        { type: 'voice' },
+        { mimeType: /^image\//i },
+        { mimeType: /^video\//i },
+        { mimeType: /^audio\//i },
+        { mimeType: /application\/pdf/i },
+        { mimeType: /document/i },
+        { mimeType: /sheet/i },
+        { mimeType: /presentation/i },
+        { mimeType: /text\//i },
+      ];
+    } else if (query.kind === 'audio') {
+      criteria.$or = [
+        { type: 'audio' },
+        { type: 'voice' },
+        { mimeType: /^audio\//i },
+      ];
+    } else {
+      criteria.$or = [
+        { type: query.kind },
+        { mimeType: new RegExp(`^${escapeRegex(query.kind)}/`, 'i') },
+      ];
+    }
+  }
+
+  if (query.q) {
+    criteria.fileName = { $regex: escapeRegex(String(query.q).trim()), $options: 'i' };
+  }
+
+  if (query.from || query.to) {
+    criteria.createdAt = {};
+    if (query.from) {
+      criteria.createdAt.$gte = new Date(query.from);
+    }
+    if (query.to) {
+      criteria.createdAt.$lte = new Date(query.to);
+    }
+  }
+
+  const [items, total] = await Promise.all([
+    Message.find(criteria)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('senderId', 'fullName username profileImage'),
+    Message.countDocuments(criteria),
+  ]);
+
+  return {
+    items: items.map((item) => ({
+      ...item.toObject(),
+      mediaKind: buildMediaKind(item),
+    })),
     meta: buildPaginationMeta({ page, limit, total }),
   };
 }
@@ -491,6 +612,7 @@ module.exports = {
   listMessages,
   searchMessages,
   listPinnedMessages,
+  listSharedFiles,
   getMessageById,
   editMessage,
   pinMessage,

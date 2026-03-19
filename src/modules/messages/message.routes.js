@@ -9,6 +9,7 @@ const router = express.Router();
 router.use(authenticate);
 
 router.post('/', validation.sendMessageValidation, validateRequest, controller.sendMessage);
+router.get('/files', validation.sharedFilesValidation, validateRequest, controller.listSharedFiles);
 router.get('/chat/:chatId', validation.chatMessageListValidation, validateRequest, controller.listMessages);
 router.get('/chat/:chatId/search', validation.messageSearchValidation, validateRequest, controller.searchMessages);
 router.get('/chat/:chatId/pinned', validation.chatMessageListValidation, validateRequest, controller.listPinnedMessages);

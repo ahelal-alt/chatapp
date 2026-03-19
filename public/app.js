@@ -26,6 +26,18 @@ const state = {
   groups: [],
   notifications: [],
   unreadNotificationCount: 0,
+  filesHub: {
+    items: [],
+    isLoading: false,
+    error: '',
+    filters: {
+      kind: 'all',
+      chatId: '',
+      senderId: '',
+      q: '',
+      from: '',
+    },
+  },
   admin: {
     summary: null,
   },
@@ -36,6 +48,12 @@ const state = {
   theme: 'dark',
   liveConnectionState: 'idle',
   replyDraft: null,
+  voiceDraft: null,
+  voiceRecorder: {
+    isRecording: false,
+    isProcessing: false,
+    durationMs: 0,
+  },
   modal: null,
 };
 
@@ -552,6 +570,7 @@ function connectLiveSocket() {
     if (!current.some((item) => item.id === message.id)) {
       state.messagesByChat[chatId] = [...current, message];
     }
+    syncFilesHubFromMessage(message);
 
     const chat = state.chats.find((item) => item.id === chatId);
     if (chat) {
@@ -577,11 +596,13 @@ function connectLiveSocket() {
     state.messagesByChat[message.chatId] = (state.messagesByChat[message.chatId] || []).map((item) => (
       item.id === message.id ? { ...item, ...message } : item
     ));
+    syncFilesHubFromMessage(message);
     render();
   });
 
   socket.on('message:deleted', ({ chatId, messageId }) => {
     state.messagesByChat[chatId] = (state.messagesByChat[chatId] || []).filter((item) => item.id !== String(messageId));
+    state.filesHub.items = state.filesHub.items.filter((item) => item.messageId !== String(messageId));
     render();
   });
 
@@ -651,8 +672,13 @@ function syncDemoState() {
   state.notifications = structuredClone(demoWorkspace.notifications);
   state.unreadNotificationCount = state.notifications.filter((item) => !item.isRead).length;
   state.messagesByChat = structuredClone(demoWorkspace.messagesByChat);
+  state.filesHub.items = buildFilesHubFromMessages(state.messagesByChat, state.chats);
+  state.filesHub.error = '';
+  state.filesHub.isLoading = false;
   state.admin.summary = null;
   state.typingByChat = {};
+  discardVoiceDraft({ silent: true });
+  resetVoiceRecorderState();
   state.selectedChatId = state.chats.some((item) => item.id === state.selectedChatId)
     ? state.selectedChatId
     : state.chats[0]?.id || null;
@@ -713,6 +739,8 @@ async function loadLiveWorkspace() {
     applyGroupDetailsToChats();
     state.messagesByChat = {};
     state.typingByChat = {};
+    discardVoiceDraft({ silent: true });
+    resetVoiceRecorderState();
     state.selectedChatId = state.chats[0]?.id || null;
     state.selectedContactId = state.contacts[0]?.id || null;
     state.selectedGroupId = state.groups[0]?.id || null;
@@ -720,6 +748,8 @@ async function loadLiveWorkspace() {
     if (state.selectedChatId) {
       await loadChatMessages(state.selectedChatId);
     }
+
+    await loadFilesHub({ silent: true });
 
     connectLiveSocket();
 
@@ -868,6 +898,30 @@ function normalizeNotification(item) {
   };
 }
 
+function classifyFileKind(mimeType, fallbackType = 'other') {
+  if ((mimeType || '').startsWith('image/')) {
+    return 'image';
+  }
+  if ((mimeType || '').startsWith('video/')) {
+    return 'video';
+  }
+  if ((mimeType || '').startsWith('audio/')) {
+    return 'audio';
+  }
+  if ((mimeType || '').includes('pdf')
+    || (mimeType || '').includes('document')
+    || (mimeType || '').includes('sheet')
+    || (mimeType || '').includes('presentation')
+    || (mimeType || '').startsWith('text/')) {
+    return 'document';
+  }
+  if (['image', 'video', 'audio', 'document', 'other'].includes(fallbackType)) {
+    return fallbackType;
+  }
+
+  return 'other';
+}
+
 function normalizeGroup(group) {
   return {
     id: group._id || group.id,
@@ -891,19 +945,79 @@ function normalizeMessage(item) {
   return {
     id: item._id || item.id,
     chatId: item.chatId?._id || item.chatId || null,
+    clientMessageId: item.clientMessageId || '',
     senderId,
     senderName: sender.fullName || 'Unknown user',
     text: item.text || '',
     type: item.type || 'text',
     mediaUrl: item.mediaUrl || '',
+    thumbnailUrl: item.thumbnailUrl || '',
+    mimeType: item.mimeType || '',
     fileName: item.fileName || '',
+    fileSize: Number(item.fileSize || 0),
+    duration: Number(item.duration || 0),
     replyText: item.replyToMessageId?.text || '',
     createdAt: item.createdAt,
     editedAt: item.editedAt || null,
     pinnedAt: item.pinnedAt || null,
     seenCount: item.seenBy?.length || 0,
+    deliveryState: item.deliveryState || 'sent',
     mine: String(senderId) === String(state.user?.id),
   };
+}
+
+function normalizeFileItem(item) {
+  const sender = item.senderId || {};
+  const rawType = item.mediaKind || item.type || 'file';
+  const type = rawType === 'voice' ? 'audio' : rawType === 'file' ? classifyFileKind(item.mimeType, rawType) : rawType;
+  return {
+    id: item._id || item.id,
+    messageId: item._id || item.id,
+    chatId: item.chatId?._id || item.chatId || null,
+    senderId: sender._id || sender.id || item.senderId || '',
+    senderName: sender.fullName || item.senderName || 'Unknown user',
+    fileName: item.fileName || item.text || 'Attachment',
+    mediaUrl: item.mediaUrl || '',
+    thumbnailUrl: item.thumbnailUrl || '',
+    mimeType: item.mimeType || '',
+    fileSize: Number(item.fileSize || 0),
+    duration: Number(item.duration || 0),
+    type,
+    createdAt: item.createdAt || new Date().toISOString(),
+  };
+}
+
+function buildFilesHubFromMessages(messagesByChat, chats) {
+  const chatMap = new Map((chats || []).map((chat) => [String(chat.id), chat]));
+
+  return Object.values(messagesByChat || {})
+    .flat()
+    .filter((message) => message.mediaUrl)
+    .map((message) => {
+      const chat = chatMap.get(String(message.chatId));
+      return {
+        ...normalizeFileItem(message),
+        sourceTitle: chat?.title || 'Conversation',
+      };
+    })
+    .sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt));
+}
+
+function syncFilesHubFromMessage(message) {
+  if (!message?.mediaUrl) {
+    return;
+  }
+
+  const chat = state.chats.find((item) => item.id === message.chatId);
+  const fileItem = {
+    ...normalizeFileItem(message),
+    sourceTitle: chat?.title || 'Conversation',
+  };
+
+  state.filesHub.items = [
+    fileItem,
+    ...state.filesHub.items.filter((item) => item.messageId !== fileItem.messageId),
+  ];
 }
 
 function buildGroupsFromChats(chats) {
@@ -981,6 +1095,63 @@ async function loadChatMessages(chatId) {
   render();
 }
 
+async function loadFilesHub({ silent = false } = {}) {
+  if (state.dataSource === 'demo') {
+    state.filesHub.items = buildFilesHubFromMessages(state.messagesByChat, state.chats);
+    state.filesHub.error = '';
+    state.filesHub.isLoading = false;
+    if (!silent) {
+      render();
+    }
+    return;
+  }
+
+  try {
+    state.filesHub.isLoading = true;
+    state.filesHub.error = '';
+    if (!silent) {
+      render();
+    }
+
+    const params = new URLSearchParams();
+    const filters = state.filesHub.filters;
+    if (filters.kind && filters.kind !== 'all') {
+      params.set('kind', filters.kind);
+    }
+    if (filters.chatId) {
+      params.set('chatId', filters.chatId);
+    }
+    if (filters.senderId) {
+      params.set('senderId', filters.senderId);
+    }
+    if (filters.q) {
+      params.set('q', filters.q);
+    }
+    if (filters.from) {
+      params.set('from', filters.from);
+    }
+    params.set('limit', '100');
+
+    const response = await apiFetch(`/api/v1/messages/files?${params.toString()}`);
+    state.filesHub.items = (response.data || []).map((item) => {
+      const normalized = normalizeFileItem(item);
+      const source = state.chats.find((chat) => chat.id === normalized.chatId);
+      return {
+        ...normalized,
+        sourceTitle: source?.title || 'Conversation',
+      };
+    });
+    state.filesHub.error = '';
+  } catch (error) {
+    state.filesHub.error = error.message || 'Files could not be loaded.';
+  } finally {
+    state.filesHub.isLoading = false;
+    if (!silent) {
+      render();
+    }
+  }
+}
+
 async function apiFetch(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set('Content-Type', 'application/json');
@@ -1003,6 +1174,267 @@ async function apiFetch(path, options = {}) {
   }
 
   return payload;
+}
+
+async function uploadChatMediaFile(file) {
+  const headers = new Headers();
+  if (state.token) {
+    headers.set('Authorization', `Bearer ${state.token}`);
+  }
+
+  const formData = new FormData();
+  formData.set('file', file, file.name || `upload-${Date.now()}`);
+
+  const response = await fetch('/api/v1/uploads/chat-media', {
+    method: 'POST',
+    headers,
+    body: formData,
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.message || 'Upload failed');
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+
+  return payload;
+}
+
+let voiceDurationTimer = null;
+
+function supportsVoiceRecording() {
+  return Boolean(
+    window.MediaRecorder
+      && window.navigator?.mediaDevices?.getUserMedia,
+  );
+}
+
+function getPreferredVoiceMimeType() {
+  if (!window.MediaRecorder?.isTypeSupported) {
+    return '';
+  }
+
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg',
+  ];
+
+  return candidates.find((type) => window.MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function guessAudioExtension(mimeType) {
+  if (mimeType.includes('ogg')) {
+    return '.ogg';
+  }
+  if (mimeType.includes('mp4') || mimeType.includes('m4a')) {
+    return '.m4a';
+  }
+  if (mimeType.includes('wav')) {
+    return '.wav';
+  }
+
+  return '.webm';
+}
+
+function resetVoiceRecorderState() {
+  if (voiceDurationTimer) {
+    window.clearInterval(voiceDurationTimer);
+    voiceDurationTimer = null;
+  }
+
+  if (state.voiceRecorder?.stream) {
+    state.voiceRecorder.stream.getTracks().forEach((track) => track.stop());
+  }
+
+  state.voiceRecorder = {
+    isRecording: false,
+    isProcessing: false,
+    durationMs: 0,
+  };
+}
+
+function discardVoiceDraft({ silent = false } = {}) {
+  if (state.voiceDraft?.previewUrl?.startsWith('blob:') && typeof URL.revokeObjectURL === 'function') {
+    URL.revokeObjectURL(state.voiceDraft.previewUrl);
+  }
+
+  state.voiceDraft = null;
+
+  if (!silent) {
+    render();
+  }
+}
+
+async function startVoiceRecording() {
+  if (!supportsVoiceRecording()) {
+    pushToast('Voice unavailable', 'This browser does not support microphone recording in the current environment.', 'info');
+    render();
+    return;
+  }
+
+  if (state.voiceRecorder.isRecording || state.voiceRecorder.isProcessing) {
+    return;
+  }
+
+  try {
+    const stream = await window.navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = getPreferredVoiceMimeType();
+    const recorder = mimeType ? new window.MediaRecorder(stream, { mimeType }) : new window.MediaRecorder(stream);
+    const startedAt = Date.now();
+    const chunks = [];
+
+    recorder.ondataavailable = (event) => {
+      if (event.data?.size) {
+        chunks.push(event.data);
+      }
+    };
+
+    recorder.onstop = () => {
+      const durationMs = Math.max(1000, Date.now() - startedAt);
+      const blobType = recorder.mimeType || mimeType || 'audio/webm';
+      const blob = new Blob(chunks, { type: blobType });
+      const file = new File(
+        [blob],
+        `voice-${Date.now()}${guessAudioExtension(blobType)}`,
+        { type: blobType },
+      );
+
+      discardVoiceDraft({ silent: true });
+      state.voiceDraft = {
+        blob,
+        file,
+        previewUrl: typeof URL.createObjectURL === 'function' ? URL.createObjectURL(blob) : '',
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: file.type,
+        duration: Math.max(1, Math.round(durationMs / 1000)),
+      };
+
+      resetVoiceRecorderState();
+      render();
+    };
+
+    state.voiceRecorder = {
+      isRecording: true,
+      isProcessing: false,
+      durationMs: 0,
+      stream,
+      recorder,
+      startedAt,
+    };
+
+    voiceDurationTimer = window.setInterval(() => {
+      state.voiceRecorder.durationMs = Date.now() - startedAt;
+      render();
+    }, 250);
+
+    recorder.start();
+    render();
+  } catch (error) {
+    resetVoiceRecorderState();
+    pushToast('Microphone unavailable', error.message || 'The microphone could not be accessed.', 'error');
+    render();
+  }
+}
+
+function stopVoiceRecording() {
+  if (!state.voiceRecorder?.isRecording || !state.voiceRecorder.recorder) {
+    return;
+  }
+
+  if (voiceDurationTimer) {
+    window.clearInterval(voiceDurationTimer);
+    voiceDurationTimer = null;
+  }
+
+  state.voiceRecorder.isRecording = false;
+  state.voiceRecorder.isProcessing = true;
+  state.voiceRecorder.recorder.stop();
+  render();
+}
+
+async function sendVoiceDraft(chatId) {
+  if (!chatId || !state.voiceDraft) {
+    return;
+  }
+
+  if (state.dataSource === 'demo') {
+    const message = {
+      id: `voice-${Date.now()}`,
+      chatId,
+      senderId: state.user.id,
+      senderName: state.user.fullName,
+      text: '',
+      type: 'voice',
+      mediaUrl: state.voiceDraft.previewUrl,
+      fileName: state.voiceDraft.fileName,
+      fileSize: state.voiceDraft.fileSize,
+      mimeType: state.voiceDraft.mimeType,
+      duration: state.voiceDraft.duration,
+      replyText: '',
+      createdAt: new Date().toISOString(),
+      editedAt: null,
+      seenCount: 0,
+      deliveryState: 'sent',
+      mine: true,
+    };
+    state.messagesByChat[chatId] = [...(state.messagesByChat[chatId] || []), message];
+    syncFilesHubFromMessage(message);
+    const chat = state.chats.find((item) => item.id === chatId);
+    if (chat) {
+      chat.lastMessagePreview = 'Voice message';
+      chat.lastMessageAt = message.createdAt;
+    }
+    state.replyDraft = null;
+    state.voiceDraft = null;
+    pushToast('Voice message ready', 'The demo conversation now includes your recorded note.', 'success');
+    render();
+    return;
+  }
+
+  try {
+    state.isSubmitting = true;
+    render();
+    const upload = await uploadChatMediaFile(state.voiceDraft.file);
+    const response = await apiFetch('/api/v1/messages', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({
+        chatId,
+        type: 'voice',
+        text: '',
+        mediaUrl: upload.data?.url,
+        mimeType: upload.data?.mimeType || state.voiceDraft.mimeType,
+        fileName: upload.data?.fileName || state.voiceDraft.fileName,
+        fileSize: upload.data?.fileSize || state.voiceDraft.fileSize,
+        duration: state.voiceDraft.duration,
+        replyToMessageId: state.replyDraft?.id || null,
+      }),
+    });
+    const message = normalizeMessage(response.data);
+    const existingMessages = state.messagesByChat[chatId] || [];
+    state.messagesByChat[chatId] = existingMessages.some((item) => item.id === message.id)
+      ? existingMessages.map((item) => (item.id === message.id ? message : item))
+      : [...existingMessages, message];
+    syncFilesHubFromMessage(message);
+    const chat = state.chats.find((item) => item.id === chatId);
+    if (chat) {
+      chat.lastMessagePreview = 'Voice message';
+      chat.lastMessageAt = message.createdAt;
+    }
+    discardVoiceDraft({ silent: true });
+    state.replyDraft = null;
+    pushToast('Voice sent', 'Your voice message is now part of the conversation.', 'success');
+  } catch (error) {
+    pushToast('Voice send failed', error.message, 'error');
+  } finally {
+    state.isSubmitting = false;
+    render();
+  }
 }
 
 function render() {
@@ -1249,6 +1681,7 @@ function renderWorkspace() {
           </div>
           <div class="nav-stack">
             ${renderNavButton('chats', 'Chats', state.chats.length)}
+            ${renderNavButton('files', 'Files', state.filesHub.items.length)}
             ${renderNavButton('contacts', 'Contacts', state.contacts.length)}
             ${renderNavButton('requests', 'Requests', pendingCount)}
             ${renderNavButton('groups', 'Groups', state.groups.length)}
@@ -1304,8 +1737,8 @@ function renderNavButton(section, label, count = 0) {
 function renderMobileDock(unreadCount, pendingCount) {
   const items = [
     ['chats', 'Chats', state.chats.length],
+    ['files', 'Files', state.filesHub.items.length],
     ['contacts', 'Contacts', state.contacts.length],
-    ['requests', 'Requests', pendingCount],
     ['notifications', 'Alerts', unreadCount],
   ];
 
@@ -1329,6 +1762,7 @@ function renderMobileDock(unreadCount, pendingCount) {
 function navHint(section) {
   const map = {
     chats: 'Recent conversations',
+    files: 'Shared media and docs',
     contacts: 'People you can reach',
     requests: 'Incoming and outgoing',
     groups: 'Rooms and membership',
@@ -1341,6 +1775,10 @@ function navHint(section) {
 }
 
 function renderSidebarContent(selectedChat) {
+  if (state.isLoading) {
+    return renderListSkeleton(5);
+  }
+
   if (state.activeSection === 'contacts') {
     const favorites = state.contacts.filter((item) => item.isFavorite);
     return `
@@ -1397,6 +1835,22 @@ function renderSidebarContent(selectedChat) {
   `;
 }
 
+function renderListSkeleton(count = 4) {
+  return `
+    <div class="list-stack">
+      ${Array.from({ length: count }, () => `
+        <div class="mini-card skeleton-row-card">
+          <div class="skeleton skeleton-avatar small"></div>
+          <div class="skeleton-copy">
+            <div class="skeleton skeleton-line"></div>
+            <div class="skeleton skeleton-line short"></div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
 function renderMiniPersonCard(contact, action) {
   return `
     <button class="mini-card" type="button" data-action="${action}" data-contact-id="${contact.id}">
@@ -1418,7 +1872,7 @@ function renderMiniGroupCard(group) {
         ${renderAvatar(group.name, group.image, 'small')}
         <div class="row-body" style="flex: 1;">
           <strong>${escapeHtml(group.name)}</strong>
-          <span class="caption">${group.members?.length || 0} members</span>
+          <span class="caption">${group.memberCount || group.members?.length || 0} members</span>
         </div>
       </div>
     </button>
@@ -1434,7 +1888,23 @@ function renderMiniNotification(item) {
   `;
 }
 
+function renderMiniFileCard(item) {
+  return `
+    <button class="mini-card" type="button" data-action="open-file-chat" data-chat-id="${item.chatId}">
+      <div class="row-head">
+        <div class="avatar-shell small">${fileTypeIcon(item.type)}</div>
+        <div class="row-body" style="flex: 1;">
+          <strong>${escapeHtml(item.fileName)}</strong>
+          <span class="caption">${escapeHtml(item.sourceTitle || 'Conversation')}</span>
+        </div>
+      </div>
+    </button>
+  `;
+}
+
 function renderChatRow(chat, isActive) {
+  const preview = getChatPreviewText(chat);
+
   return `
     <button
       type="button"
@@ -1449,7 +1919,7 @@ function renderChatRow(chat, isActive) {
             <strong>${escapeHtml(chat.title)}</strong>
             <span class="caption">${relativeTime(chat.lastMessageAt)}</span>
           </div>
-          <span class="row-subtitle">${escapeHtml(chat.lastMessagePreview)}</span>
+          <span class="row-subtitle ${preview.isTyping ? 'is-typing-text' : ''}">${escapeHtml(preview.text)}</span>
         </div>
       </div>
       <div class="row-meta">
@@ -1464,8 +1934,33 @@ function renderChatRow(chat, isActive) {
   `;
 }
 
+function getChatPreviewText(chat) {
+  const typingText = state.typingByChat[chat.id];
+  if (typingText) {
+    return {
+      text: typingText,
+      isTyping: true,
+    };
+  }
+
+  const latestMessage = (state.messagesByChat[chat.id] || []).slice(-1)[0];
+  if (latestMessage?.mine && latestMessage.text) {
+    return {
+      text: `You: ${latestMessage.text}`,
+      isTyping: false,
+    };
+  }
+
+  return {
+    text: chat.lastMessagePreview || 'No messages yet',
+    isTyping: false,
+  };
+}
+
 function renderMainPanel() {
   switch (state.activeSection) {
+    case 'files':
+      return renderFilesPanel();
     case 'contacts':
       return renderContactsPanel();
     case 'requests':
@@ -1486,6 +1981,67 @@ function renderMainPanel() {
   }
 }
 
+function renderFilesPanel() {
+  const filteredItems = getFilteredFilesHubItems();
+  const senderOptions = Array.from(
+    new Map(filteredItems.map((item) => [item.senderId, item.senderName])).entries(),
+  );
+
+  return `
+    <div class="panel-header">
+      <div>
+        <h2>Shared files hub</h2>
+        <p>Browse documents, voice notes, and media across your conversations without leaving the workspace.</p>
+      </div>
+      <div class="segmented-control">
+        ${['all', 'image', 'video', 'audio', 'document', 'other'].map((kind) => `
+          <button
+            type="button"
+            class="${state.filesHub.filters.kind === kind ? 'is-active' : ''}"
+            data-action="set-files-kind"
+            data-kind="${kind}"
+          >${capitalize(kind)}</button>
+        `).join('')}
+      </div>
+    </div>
+    <div class="files-toolbar">
+      <label class="field-group">
+        <span>Search</span>
+        <input type="search" value="${escapeAttribute(state.filesHub.filters.q)}" placeholder="Filename or type" data-action="noop" data-role="files-search" />
+      </label>
+      <label class="field-group">
+        <span>Conversation</span>
+        <select data-role="files-chat-filter">
+          <option value="">All chats</option>
+          ${state.chats.map((chat) => `<option value="${chat.id}" ${state.filesHub.filters.chatId === chat.id ? 'selected' : ''}>${escapeHtml(chat.title)}</option>`).join('')}
+        </select>
+      </label>
+      <label class="field-group">
+        <span>Sender</span>
+        <select data-role="files-sender-filter">
+          <option value="">Anyone</option>
+          ${senderOptions.map(([id, name]) => `<option value="${id}" ${state.filesHub.filters.senderId === id ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('')}
+        </select>
+      </label>
+      <label class="field-group">
+        <span>From</span>
+        <input type="date" value="${escapeAttribute(state.filesHub.filters.from)}" data-role="files-date-filter" />
+      </label>
+      <div class="files-toolbar-actions">
+        <button class="ghost-button" type="button" data-action="apply-files-filters">Apply</button>
+        <button class="ghost-button" type="button" data-action="reset-files-filters">Reset</button>
+      </div>
+    </div>
+    ${state.filesHub.isLoading
+      ? renderFilesHubSkeleton()
+      : state.filesHub.error
+        ? `<div class="empty-card"><h3>Files unavailable</h3><p>${escapeHtml(state.filesHub.error)}</p><button class="primary-button" type="button" data-action="apply-files-filters">Retry</button></div>`
+        : filteredItems.length
+          ? `<div class="files-grid">${filteredItems.map(renderFileCard).join('')}</div>`
+          : '<div class="empty-card"><h3>No shared files yet</h3><p>Voice notes, uploads, and media will collect here once they are sent.</p></div>'}
+  `;
+}
+
 function renderChatsPanel() {
   const selectedChat = getSelectedChat();
   const messages = selectedChat ? state.messagesByChat[selectedChat.id] || [] : [];
@@ -1504,7 +2060,7 @@ function renderChatsPanel() {
     <div class="panel-header">
       <div>
         <h2>Conversation workspace</h2>
-        <p>Review message history, keep the profile rail nearby, and send the next message from a focused composer.</p>
+        <p>Fast, private messaging with smooth live state, contextual details, and focused composition.</p>
       </div>
       <div class="segmented-control">
         <button type="button" class="is-active">Messages</button>
@@ -1535,33 +2091,49 @@ function renderChatsPanel() {
             <span class="row-subtitle">${escapeHtml(selectedChat.subtitle || selectedChat.partnerStatus || '')}</span>
           </div>
         </div>
+        <div class="chat-header-actions">
+          ${selectedChat.type === 'private' ? '<span class="tag">Private space</span>' : ''}
+          <button class="ghost-button icon-button" type="button" data-action="composer-emoji" title="Emoji">☺</button>
+          <button class="ghost-button icon-button" type="button" data-action="composer-attach" title="Attach">+</button>
+        </div>
       </div>
       <div class="messages-stream">
         ${messages.length
           ? messages.map(renderMessage).join('')
-          : '<div class="empty-card"><h3>No messages yet</h3><p>Send the first message to create the conversation history.</p></div>'}
+          : '<div class="empty-card"><h3>No chats yet</h3><p>Start the first message to create a conversation timeline for this workspace.</p><button class="primary-button" type="button" data-action="focus-composer">Start typing</button></div>'}
       </div>
-      ${typingText ? `<div class="helper-text" style="padding: 0 24px 8px;">${escapeHtml(typingText)}</div>` : ''}
+      ${typingText ? renderTypingIndicator(typingText) : ''}
       <div class="composer-card">
         <form id="message-form">
           <input type="hidden" name="chatId" value="${selectedChat.id}" />
           ${state.replyDraft
             ? `
-              <div class="reply-chip">
-                Replying to: ${escapeHtml(state.replyDraft.text || 'Attachment')}
+              <div class="reply-chip reply-draft">
+                <span>Replying to: ${escapeHtml(state.replyDraft.text || 'Attachment')}</span>
                 <button class="ghost-button" type="button" data-action="cancel-reply" style="padding: 8px 10px;">Cancel</button>
               </div>
             `
             : ''}
-          <label class="sr-only" for="message-text">Message</label>
-          <textarea id="message-text" class="composer-input" name="text" placeholder="Write a message..." rows="4" required></textarea>
+          ${renderVoiceDraftPreview()}
+          <div class="composer-shell">
+            <button class="ghost-button icon-button" type="button" data-action="composer-emoji" title="Open emoji picker">☺</button>
+            <label class="sr-only" for="message-text">Message</label>
+            <textarea id="message-text" class="composer-input" name="text" placeholder="Write a message..." rows="3"></textarea>
+            <button class="ghost-button icon-button" type="button" data-action="composer-attach" title="Add attachment">+</button>
+            <button
+              class="ghost-button icon-button ${state.voiceRecorder.isRecording ? 'is-recording' : ''}"
+              type="button"
+              data-action="toggle-recording"
+              title="${state.voiceRecorder.isRecording ? 'Stop recording' : 'Record voice note'}"
+            >${state.voiceRecorder.isRecording ? '■' : '🎙'}</button>
+          </div>
           <div class="composer-actions">
             <div class="tag-row">
               <span class="tag">Seen status</span>
-              <span class="tag">Typing-ready layout</span>
-              <span class="tag">Attachment slot</span>
+              <span class="tag">Reply-ready</span>
+              <span class="tag">${state.voiceDraft ? 'Voice preview ready' : state.voiceRecorder.isRecording ? `Recording ${formatDuration(Math.ceil(state.voiceRecorder.durationMs / 1000))}` : 'Voice-ready'}</span>
             </div>
-            <button class="primary-button" type="submit">Send message</button>
+            <button class="primary-button" type="submit" ${state.voiceRecorder.isRecording || state.isSubmitting ? 'disabled' : ''}>Send message</button>
           </div>
         </form>
       </div>
@@ -1569,27 +2141,192 @@ function renderChatsPanel() {
   `;
 }
 
+function renderVoiceDraftPreview() {
+  if (state.voiceRecorder.isRecording) {
+    return `
+      <div class="voice-draft-card is-recording">
+        <div class="voice-draft-copy">
+          <span class="recording-indicator"></span>
+          <strong>Recording voice note</strong>
+          <span class="caption">${formatDuration(Math.ceil(state.voiceRecorder.durationMs / 1000))}</span>
+        </div>
+        <div class="request-actions">
+          <button class="ghost-button" type="button" data-action="toggle-recording">Stop</button>
+        </div>
+      </div>
+    `;
+  }
+
+  if (state.voiceRecorder.isProcessing) {
+    return `
+      <div class="voice-draft-card">
+        <div class="voice-draft-copy">
+          <strong>Preparing your voice note</strong>
+          <span class="caption">Processing the recorded audio preview…</span>
+        </div>
+      </div>
+    `;
+  }
+
+  if (!state.voiceDraft) {
+    return '';
+  }
+
+  return `
+    <div class="voice-draft-card">
+      <div class="voice-draft-copy">
+        <strong>Voice note ready</strong>
+        <span class="caption">${formatDuration(state.voiceDraft.duration)} • ${formatFileSize(state.voiceDraft.fileSize)}</span>
+      </div>
+      <audio class="voice-preview-player" controls preload="metadata" src="${escapeAttribute(state.voiceDraft.previewUrl)}"></audio>
+      <div class="request-actions">
+        <button class="ghost-button" type="button" data-action="discard-voice">Discard</button>
+        <button class="primary-button" type="button" data-action="send-voice">Send voice</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderTypingIndicator(text) {
+  return `
+    <div class="typing-indicator" aria-live="polite">
+      <div class="typing-dots">
+        <span></span>
+        <span></span>
+        <span></span>
+      </div>
+      <span>${escapeHtml(text)}</span>
+    </div>
+  `;
+}
+
+function getFilteredFilesHubItems() {
+  const { kind, chatId, senderId, q, from } = state.filesHub.filters;
+  return state.filesHub.items.filter((item) => {
+    if (kind !== 'all' && item.type !== kind) {
+      return false;
+    }
+    if (chatId && item.chatId !== chatId) {
+      return false;
+    }
+    if (senderId && item.senderId !== senderId) {
+      return false;
+    }
+    if (from && new Date(item.createdAt) < new Date(from)) {
+      return false;
+    }
+    if (q && !`${item.fileName} ${item.type}`.toLowerCase().includes(q.toLowerCase())) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function renderFilesHubSkeleton() {
+  return `
+    <div class="files-grid">
+      ${Array.from({ length: 6 }, () => `
+        <div class="skeleton-card">
+          <div class="skeleton skeleton-line"></div>
+          <div class="skeleton skeleton-line short"></div>
+          <div class="skeleton skeleton-bubble wide"></div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderFileCard(item) {
+  const isImage = item.type === 'image';
+  const isVideo = item.type === 'video';
+  const isAudio = item.type === 'audio';
+
+  return `
+    <article class="file-card">
+      <div class="file-card-preview ${isImage || isVideo ? 'has-media' : ''}">
+        ${isImage
+          ? `<img src="${escapeAttribute(item.mediaUrl)}" alt="${escapeAttribute(item.fileName)}" />`
+          : isVideo
+            ? `<video src="${escapeAttribute(item.mediaUrl)}" controls preload="metadata"></video>`
+            : isAudio
+              ? `<audio src="${escapeAttribute(item.mediaUrl)}" controls preload="metadata"></audio>`
+              : `<div class="file-card-icon">${fileTypeIcon(item.type)}</div>`}
+      </div>
+      <div class="file-card-copy">
+        <div class="split-row">
+          <strong>${escapeHtml(item.fileName)}</strong>
+          <span class="tag">${escapeHtml(item.type)}</span>
+        </div>
+        <p class="caption">${escapeHtml(item.sourceTitle || 'Conversation')} • ${escapeHtml(item.senderName)} • ${relativeTime(item.createdAt)}</p>
+        <div class="tag-row">
+          ${item.duration ? `<span class="tag">${formatDuration(item.duration)}</span>` : ''}
+          ${item.fileSize ? `<span class="tag">${formatFileSize(item.fileSize)}</span>` : ''}
+        </div>
+      </div>
+      <div class="request-actions">
+        <a class="ghost-button" href="${escapeAttribute(item.mediaUrl)}" target="_blank" rel="noreferrer">Open</a>
+        <button class="primary-button" type="button" data-action="open-file-chat" data-chat-id="${item.chatId}">Open in chat</button>
+      </div>
+    </article>
+  `;
+}
+
+function fileTypeIcon(type) {
+  const icons = {
+    image: '◻',
+    video: '▶',
+    audio: '♪',
+    document: '▤',
+    other: '⬢',
+  };
+
+  return icons[type] || '⬢';
+}
+
 function renderMessage(message) {
+  const isImage = isImageAttachment(message);
+  const isVoice = message.type === 'voice';
+
   return `
     <article class="message-row ${message.mine ? 'mine' : ''}">
       ${message.mine ? '' : renderAvatar(message.senderName, '', 'small')}
-      <div class="message-bubble">
+      <div class="message-bubble ${message.mine ? 'sent' : 'received'}">
         ${message.replyText ? `<div class="reply-chip">${escapeHtml(message.replyText)}</div>` : ''}
         ${message.pinnedAt ? '<div class="reply-chip">Pinned message</div>' : ''}
         ${message.mine ? '' : `<strong>${escapeHtml(message.senderName)}</strong>`}
-        <p class="message-text">${escapeHtml(message.text)}</p>
-        ${message.mediaUrl ? `<a class="caption" href="${escapeAttribute(message.mediaUrl)}" target="_blank" rel="noreferrer">${escapeHtml(message.fileName || 'Open attachment')}</a>` : ''}
-        <div class="request-actions">
+        ${message.text ? `<p class="message-text">${escapeHtml(message.text)}</p>` : ''}
+        ${message.mediaUrl
+          ? isVoice
+            ? `
+              <div class="message-voice-card">
+                <div class="voice-badge-row">
+                  <span class="tag">Voice</span>
+                  <span class="caption">${formatDuration(message.duration || 0)}</span>
+                </div>
+                <audio class="voice-message-player" controls preload="metadata" src="${escapeAttribute(message.mediaUrl)}"></audio>
+              </div>
+            `
+            : isImage
+            ? `<a class="message-attachment-preview" href="${escapeAttribute(message.mediaUrl)}" target="_blank" rel="noreferrer"><img src="${escapeAttribute(message.mediaUrl)}" alt="${escapeAttribute(message.fileName || 'Attachment')}" /></a>`
+            : `<a class="message-file-card" href="${escapeAttribute(message.mediaUrl)}" target="_blank" rel="noreferrer"><strong>${escapeHtml(message.fileName || 'Attachment')}</strong><span class="caption">${escapeHtml(message.type || 'file')} • ${formatFileSize(message.fileSize || 0)}</span></a>`
+          : ''}
+        <div class="request-actions message-actions-row">
           <button class="chip-button" type="button" data-action="reply-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reply</button>
+          <button class="chip-button" type="button" data-action="react-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reaction</button>
         </div>
         <div class="message-meta">
           <span>${formatTime(message.createdAt)}</span>
           ${message.editedAt ? '<span>edited</span>' : ''}
-          ${message.mine ? `<span>${message.seenCount ? `seen by ${message.seenCount}` : 'delivered'}</span>` : ''}
+          ${message.mine ? `<span class="message-status">${message.seenCount ? `✓✓ seen by ${message.seenCount}` : '✓ sent'}</span>` : ''}
         </div>
       </div>
     </article>
   `;
+}
+
+function isImageAttachment(message) {
+  const candidate = `${message.fileName || ''} ${message.mediaUrl || ''}`.toLowerCase();
+  return ['.jpg', '.jpeg', '.png', '.webp', 'image/'].some((token) => candidate.includes(token));
 }
 
 function renderContactsPanel() {
@@ -1600,9 +2337,15 @@ function renderContactsPanel() {
     <div class="panel-header">
       <div>
         <h2>Contacts</h2>
-        <p>Keep your high-signal people nearby, mark favorites, and jump straight into a private chat.</p>
+        <p>Keep high-signal people nearby, mark favorites, and jump into private conversations instantly.</p>
       </div>
-      <div class="status-pill neutral">${favoriteCount} favorites</div>
+      <div class="panel-actions">
+        <div class="status-pill neutral">${favoriteCount} favorites</div>
+        <div class="segmented-control">
+          <button type="button" class="is-active">All</button>
+          <button type="button" data-action="switch-section" data-section="requests">Requests</button>
+        </div>
+      </div>
     </div>
     <div class="cards-grid">
       ${contacts.length
@@ -1733,9 +2476,10 @@ function renderGroupsPanel() {
           ? `
             <p class="helper-text">${escapeHtml(selectedGroup.description || 'No description yet.')}</p>
             <div class="tag-row">
-              <span class="tag">${selectedGroup.members?.length || 0} members</span>
+              <span class="tag">${selectedGroup.memberCount || selectedGroup.members?.length || 0} members</span>
               ${selectedGroup.onlyAdminsCanMessage ? '<span class="tag">Admins message only</span>' : '<span class="tag">Open messaging</span>'}
               ${selectedGroup.onlyAdminsCanAddMembers ? '<span class="tag">Admin invites</span>' : '<span class="tag">Members can invite</span>'}
+              ${selectedGroup.currentUserRole ? `<span class="tag">Role: ${escapeHtml(selectedGroup.currentUserRole)}</span>` : ''}
             </div>
             <div class="member-strip" style="margin-top: 14px;">
               ${selectedGroup.members?.map((member) => `<span class="member-pill">${escapeHtml(member.fullName)} · ${member.role}</span>`).join('') || ''}
@@ -1761,10 +2505,14 @@ function renderGroupCard(group) {
           <strong>${escapeHtml(group.name)}</strong>
           <span class="row-subtitle">${escapeHtml(group.description || 'No description')}</span>
         </div>
+        ${group.currentUserRole ? `<span class="count-badge blue">${escapeHtml(group.currentUserRole)}</span>` : ''}
       </div>
       <div class="row-meta">
-        <span class="mini-pill">${group.members?.length || 0} members</span>
+        <span class="mini-pill">${group.memberCount || group.members?.length || 0} members</span>
         <span class="caption">Invite code: ${escapeHtml(group.inviteCode || 'n/a')}</span>
+      </div>
+      <div class="group-actions">
+        <button class="ghost-button" type="button" data-action="open-group-invite" data-group-id="${group.id}">Invite</button>
       </div>
     </button>
   `;
@@ -1820,6 +2568,12 @@ function renderAdminPanel() {
       <div class="metric-card"><span>Suspended users</span><strong>${summary.totals.suspendedUsers}</strong></div>
       <div class="metric-card"><span>Reports</span><strong>${summary.totals.reports}</strong></div>
     </div>
+    <div class="profile-card">
+      <strong>Message activity</strong>
+      <div class="chart-bars" style="margin-top: 16px;">
+        ${renderActivityBars(summary.dailyMessages)}
+      </div>
+    </div>
     <div class="cards-grid">
       <div class="profile-card">
         <strong>Recent registrations</strong>
@@ -1849,6 +2603,23 @@ function renderAdminPanel() {
       </div>
     </div>
   `;
+}
+
+function renderActivityBars(items) {
+  if (!items?.length) {
+    return '<div class="empty-card compact"><p>No activity points yet.</p></div>';
+  }
+
+  const peak = Math.max(...items.map((item) => item.count), 1);
+  return items.map((item) => `
+    <div class="chart-bar-card">
+      <span class="caption">${escapeHtml(item.date.slice(5))}</span>
+      <div class="chart-bar-track">
+        <div class="chart-bar-fill" style="height: ${Math.max(18, Math.round((item.count / peak) * 120))}px"></div>
+      </div>
+      <strong>${item.count}</strong>
+    </div>
+  `).join('');
 }
 
 function renderNotificationCard(item) {
@@ -2008,6 +2779,21 @@ function renderDetailRail() {
     `;
   }
 
+  if (state.activeSection === 'files') {
+    const recentFiles = state.filesHub.items.slice(0, 6);
+    return `
+      <div class="list-stack">
+        <div class="title-row">
+          <strong>Recent files</strong>
+          <span class="mini-pill">${state.filesHub.items.length}</span>
+        </div>
+        ${recentFiles.length
+          ? recentFiles.map(renderMiniFileCard).join('')
+          : '<div class="mini-card"><span class="muted-text">No shared files yet.</span></div>'}
+      </div>
+    `;
+  }
+
   if (state.activeSection === 'groups') {
     const group = getSelectedGroup();
     return `
@@ -2106,7 +2892,7 @@ function renderRailGroup(group) {
         ${renderAvatar(group.name, group.image, 'large')}
         <div class="row-body">
           <strong>${escapeHtml(group.name)}</strong>
-          <span class="row-subtitle">${group.members?.length || 0} members</span>
+          <span class="row-subtitle">${group.memberCount || group.members?.length || 0} members</span>
         </div>
       </div>
       <div class="tag-row">
@@ -2186,7 +2972,36 @@ function renderToasts() {
   `;
 }
 
+function renderModal() {
+  if (!state.modal) {
+    return '';
+  }
+
+  return `
+    <div class="modal-overlay">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-label="${escapeAttribute(state.modal.title)}">
+        <div class="row-head">
+          <div class="row-body">
+            <strong>${escapeHtml(state.modal.title)}</strong>
+            <span class="row-subtitle">${escapeHtml(state.modal.description || '')}</span>
+          </div>
+          <button class="ghost-button icon-button" type="button" data-action="close-modal">×</button>
+        </div>
+        <div class="modal-body">
+          ${state.modal.content || ''}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 async function handleClick(event) {
+  if (event.target.classList?.contains('modal-overlay')) {
+    state.modal = null;
+    render();
+    return;
+  }
+
   const target = event.target.closest('[data-action]');
   if (!target) {
     return;
@@ -2196,6 +3011,12 @@ async function handleClick(event) {
 
   if (action === 'switch-auth') {
     state.authView = target.dataset.view;
+    render();
+    return;
+  }
+
+  if (action === 'close-modal') {
+    state.modal = null;
     render();
     return;
   }
@@ -2218,6 +3039,8 @@ async function handleClick(event) {
 
   if (action === 'logout') {
     disconnectSocket();
+    discardVoiceDraft({ silent: true });
+    resetVoiceRecorderState();
     clearSession();
     state.token = null;
     state.refreshToken = null;
@@ -2232,6 +3055,9 @@ async function handleClick(event) {
 
   if (action === 'switch-section') {
     state.activeSection = target.dataset.section;
+    if (state.activeSection === 'files') {
+      await loadFilesHub({ silent: true });
+    }
     render();
     return;
   }
@@ -2254,6 +3080,92 @@ async function handleClick(event) {
 
   if (action === 'cancel-reply') {
     state.replyDraft = null;
+    render();
+    return;
+  }
+
+  if (action === 'composer-attach') {
+    pushToast('Attachment UI', 'File picker wiring can be connected next without changing the shell.', 'info');
+    return;
+  }
+
+  if (action === 'toggle-recording') {
+    if (state.voiceRecorder.isRecording) {
+      stopVoiceRecording();
+    } else {
+      await startVoiceRecording();
+    }
+    return;
+  }
+
+  if (action === 'discard-voice') {
+    discardVoiceDraft();
+    return;
+  }
+
+  if (action === 'send-voice') {
+    await sendVoiceDraft(state.selectedChatId);
+    return;
+  }
+
+  if (action === 'composer-emoji') {
+    pushToast('Emoji UI', 'Emoji reactions and picker are ready for the next interaction pass.', 'info');
+    return;
+  }
+
+  if (action === 'focus-composer') {
+    window.setTimeout(() => {
+      document.getElementById('message-text')?.focus();
+    }, 0);
+    return;
+  }
+
+  if (action === 'react-message') {
+    pushToast('Reactions', 'Reaction controls are now visually staged and can be connected to the backend next.', 'info');
+    return;
+  }
+
+  if (action === 'open-group-invite') {
+    await openGroupInvite(target.dataset.groupId);
+    return;
+  }
+
+  if (action === 'set-files-kind') {
+    state.filesHub.filters.kind = target.dataset.kind || 'all';
+    await loadFilesHub({ silent: true });
+    render();
+    return;
+  }
+
+  if (action === 'apply-files-filters') {
+    const searchInput = document.querySelector('[data-role="files-search"]');
+    const chatFilter = document.querySelector('[data-role="files-chat-filter"]');
+    const senderFilter = document.querySelector('[data-role="files-sender-filter"]');
+    const dateFilter = document.querySelector('[data-role="files-date-filter"]');
+    state.filesHub.filters.q = String(searchInput?.value || '').trim();
+    state.filesHub.filters.chatId = String(chatFilter?.value || '');
+    state.filesHub.filters.senderId = String(senderFilter?.value || '');
+    state.filesHub.filters.from = String(dateFilter?.value || '');
+    await loadFilesHub();
+    return;
+  }
+
+  if (action === 'reset-files-filters') {
+    state.filesHub.filters = {
+      kind: 'all',
+      chatId: '',
+      senderId: '',
+      q: '',
+      from: '',
+    };
+    await loadFilesHub();
+    return;
+  }
+
+  if (action === 'open-file-chat') {
+    state.activeSection = 'chats';
+    state.selectedChatId = target.dataset.chatId || state.selectedChatId;
+    await loadChatMessages(state.selectedChatId);
     render();
     return;
   }
@@ -2458,7 +3370,16 @@ function setSessionFromAuth(data) {
 async function handleMessageSubmit(formData, form) {
   const chatId = String(formData.get('chatId') || '');
   const text = String(formData.get('text') || '').trim();
-  if (!chatId || !text) {
+  if (!chatId) {
+    return;
+  }
+
+  if (!text && state.voiceDraft) {
+    await sendVoiceDraft(chatId);
+    return;
+  }
+
+  if (!text) {
     return;
   }
 
@@ -2858,6 +3779,40 @@ async function handleGroupCreate(formData, form) {
   }
 }
 
+async function openGroupInvite(groupId) {
+  const group = state.groups.find((item) => item.id === groupId) || getSelectedGroup();
+  if (!group) {
+    return;
+  }
+
+  if (state.dataSource === 'demo') {
+    state.modal = {
+      title: `${group.name} invite`,
+      description: 'Share this demo invite code with collaborators.',
+      content: `<div class="invite-code-card"><strong>${escapeHtml(group.inviteCode || 'DEMO')}</strong><p class="helper-text">Use this invite code in the group join flow.</p></div>`,
+    };
+    render();
+    return;
+  }
+
+  try {
+    const response = await apiFetch(`/api/v1/groups/${group.id}/invite-code`, {
+      method: 'POST',
+      headers: {},
+    });
+    const inviteCode = response.data?.inviteCode || group.inviteCode || 'LIVE';
+    state.modal = {
+      title: `${group.name} invite`,
+      description: 'A fresh invite code has been generated for this group.',
+      content: `<div class="invite-code-card"><strong>${escapeHtml(inviteCode)}</strong><p class="helper-text">Copy this code and share it with invited members.</p></div>`,
+    };
+    render();
+  } catch (error) {
+    pushToast('Invite failed', error.message, 'error');
+    render();
+  }
+}
+
 function getSelectedChat() {
   return state.chats.find((item) => item.id === state.selectedChatId) || null;
 }
@@ -2929,6 +3884,33 @@ function relativeTime(value) {
   }
 
   return `${Math.round(diff / day)}d ago`;
+}
+
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Number(totalSeconds || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.floor(seconds % 60);
+
+  return `${minutes}:${String(remainder).padStart(2, '0')}`;
+}
+
+function formatFileSize(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) {
+    return '0 KB';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = value;
+  let index = 0;
+
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+
+  const formatted = size >= 10 || index === 0 ? Math.round(size) : size.toFixed(1);
+  return `${formatted} ${units[index]}`;
 }
 
 function capitalize(value) {
