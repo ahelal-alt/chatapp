@@ -66,7 +66,7 @@ const state = {
   toasts: [],
   socket: null,
   connectedChatId: null,
-  theme: 'dark',
+  theme: 'light',
   liveConnectionState: 'idle',
   offline: {
     isOnline: window.navigator?.onLine ?? true,
@@ -77,7 +77,7 @@ const state = {
   replyDraft: null,
   voiceDraft: null,
   voiceRecorder: createInitialVoiceRecorderState(),
-  detailRailOpen: window.innerWidth > 1360,
+  detailRailOpen: false,
   mobileChatListVisible: true,
   coordination: {
     tabId: TAB_ID,
@@ -1958,7 +1958,7 @@ function clearSession() {
 let refreshRequestPromise = null;
 
 function readTheme() {
-  return window.localStorage.getItem(THEME_KEY) || 'dark';
+  return window.localStorage.getItem(THEME_KEY) || 'light';
 }
 
 function applyTheme() {
@@ -3394,7 +3394,6 @@ function renderWorkspace() {
   const unreadCount = state.unreadNotificationCount;
   const pendingCount = state.requests.incoming.length + state.requests.outgoing.length;
   const selectedChat = getSelectedChat();
-  const showDetailRail = shouldShowDetailRail();
   const sectionMeta = getSectionMeta();
   const compactChatView = state.activeSection === 'chats' && !state.mobileChatListVisible;
 
@@ -3419,7 +3418,7 @@ function renderWorkspace() {
         </div>
         <div class="topbar-right">
           ${canToggleDetailsRail()
-            ? `<button class="ghost-button" type="button" data-action="toggle-details">${showDetailRail ? 'Hide details' : 'Show details'}</button>`
+            ? `<button class="ghost-button" type="button" data-action="toggle-details">${shouldShowDetailRail() ? 'Hide details' : 'Details'}</button>`
             : ''}
           <button class="ghost-button" type="button" data-action="toggle-theme">${state.theme === 'dark' ? 'Light mode' : 'Dark mode'}</button>
           <a class="ghost-button" href="/api/docs" target="_blank" rel="noreferrer">API docs</a>
@@ -3427,7 +3426,7 @@ function renderWorkspace() {
         </div>
       </header>
       ${renderConnectionBanner()}
-      <div class="workspace-grid workspace-grid-quad ${showDetailRail ? 'with-rail' : 'without-rail'} ${compactChatView ? 'show-chat-detail' : 'show-chat-list'}">
+      <div class="workspace-grid workspace-grid-quad workspace-grid-triple ${compactChatView ? 'show-chat-detail' : 'show-chat-list'}">
         <aside class="sidebar side-panel">
           <div class="sidebar-brand">
             <div class="brand-mark compact">
@@ -3497,14 +3496,8 @@ function renderWorkspace() {
         <main class="chat-window main-panel">
           ${renderMainPanel()}
         </main>
-        ${showDetailRail
-          ? `
-            <aside class="info-panel rail-panel">
-              ${renderDetailRail()}
-            </aside>
-          `
-          : ''}
       </div>
+      ${renderDetailsDrawer()}
       ${renderMobileDock(unreadCount, pendingCount)}
       ${renderModal()}
       ${renderToasts()}
@@ -3532,7 +3525,7 @@ function renderConnectionBanner() {
 
   return `
     <div class="connection-banner ${tone}">
-      <strong>${!state.offline.isOnline ? 'Offline mode' : 'Sync status'}</strong>
+      <strong>${!state.offline.isOnline ? 'Offline' : 'Syncing'}</strong>
       <span>${message}</span>
     </div>
   `;
@@ -3548,7 +3541,6 @@ function renderNavButton(section, label, count = 0) {
     >
       <div class="row-body">
         <strong>${label}</strong>
-        <span>${navHint(section)}</span>
       </div>
       ${count ? `<span class="count-badge ${section === 'notifications' ? 'blue' : ''}">${count}</span>` : ''}
     </button>
@@ -3968,16 +3960,15 @@ function renderChatsPanel() {
           ${renderAvatar(selectedChat.title, selectedChat.avatarImage, 'large')}
           <div class="row-body">
             <h3 class="chat-title">${escapeHtml(selectedChat.title)}</h3>
-            <span class="row-subtitle">${escapeHtml(selectedChat.subtitle || selectedChat.partnerStatus || '')}</span>
-            <div class="chat-header-tags">
-              ${selectedChat.type === 'private' ? '<span class="mini-pill subtle">Direct chat</span>' : `<span class="mini-pill subtle">${selectedChat.memberCount} members</span>`}
-              ${selectedChat.unreadCount ? `<span class="mini-pill subtle">${selectedChat.unreadCount} unread</span>` : ''}
-              ${e2eeActive ? '<span class="mini-pill subtle secure">Encrypted</span>' : ''}
-            </div>
+            <span class="row-subtitle">${escapeHtml(
+              e2eeActive
+                ? `Encrypted private chat${selectedChat.partnerStatus ? ` • ${selectedChat.partnerStatus}` : ''}`
+                : selectedChat.subtitle || selectedChat.partnerStatus || '',
+            )}</span>
           </div>
         </div>
         <div class="chat-header-actions">
-          ${canToggleDetailsRail() ? `<button class="ghost-button" type="button" data-action="toggle-details">${shouldShowDetailRail() ? 'Hide details' : 'Show details'}</button>` : ''}
+          ${canToggleDetailsRail() ? `<button class="ghost-button" type="button" data-action="toggle-details">${shouldShowDetailRail() ? 'Hide details' : 'View details'}</button>` : ''}
           <button class="ghost-button icon-button" type="button" data-action="composer-emoji" title="Emoji">☺</button>
           <button class="ghost-button icon-button" type="button" data-action="composer-attach" title="Attach">+</button>
         </div>
@@ -4785,6 +4776,20 @@ function renderDetailRail() {
   `;
 }
 
+function renderDetailsDrawer() {
+  if (!shouldShowDetailRail()) {
+    return '';
+  }
+
+  return `
+    <div class="details-drawer-overlay" data-action="close-details">
+      <aside class="details-drawer" role="complementary" aria-label="Details panel">
+        ${renderDetailRail()}
+      </aside>
+    </div>
+  `;
+}
+
 function renderRailPerson(contact) {
   return `
     <div class="list-stack" style="margin-top: 16px;">
@@ -4998,9 +5003,7 @@ function getComposerStatusText(voiceState) {
 }
 
 function canToggleDetailsRail() {
-  return window.innerWidth > 1360
-    && !isMobileViewport()
-    && ['chats', 'files', 'contacts', 'groups', 'notifications', 'admin', 'profile', 'settings'].includes(state.activeSection);
+  return ['chats', 'files', 'contacts', 'groups', 'notifications', 'admin', 'profile', 'settings'].includes(state.activeSection);
 }
 
 function shouldShowDetailRail() {
@@ -5017,8 +5020,6 @@ function isMobileViewport() {
 function handleViewportChange() {
   if (isMobileViewport()) {
     state.detailRailOpen = false;
-  } else if (window.innerWidth > 1360 && canToggleDetailsRail()) {
-    state.detailRailOpen = true;
   }
 
   if (!isMobileViewport()) {
@@ -5110,6 +5111,10 @@ function renderModal() {
 }
 
 async function handleClick(event) {
+  if (event.target.closest('.details-drawer') && !event.target.closest('[data-action]')) {
+    return;
+  }
+
   if (event.target.classList?.contains('modal-overlay')) {
     state.modal = null;
     render();
@@ -5131,6 +5136,12 @@ async function handleClick(event) {
 
   if (action === 'close-modal') {
     state.modal = null;
+    render();
+    return;
+  }
+
+  if (action === 'close-details') {
+    state.detailRailOpen = false;
     render();
     return;
   }
