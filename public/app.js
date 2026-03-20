@@ -19,6 +19,8 @@ const state = {
   screen: 'auth',
   authView: 'login',
   activeSection: 'chats',
+  chatListFilter: 'all',
+  workspaceQuery: '',
   requestTab: 'incoming',
   selectedChatId: demoWorkspace.chats[0]?.id || null,
   selectedContactId: demoWorkspace.contacts[0]?.id || null,
@@ -75,6 +77,8 @@ const state = {
   replyDraft: null,
   voiceDraft: null,
   voiceRecorder: createInitialVoiceRecorderState(),
+  detailRailOpen: window.innerWidth > 1360,
+  mobileChatListVisible: true,
   coordination: {
     tabId: TAB_ID,
     isLeader: false,
@@ -90,6 +94,7 @@ appRoot.addEventListener('input', handleInput);
 
 window.addEventListener('online', handleConnectivityChange);
 window.addEventListener('offline', handleConnectivityChange);
+window.addEventListener('resize', handleViewportChange);
 window.addEventListener('pagehide', () => {
   teardownVoiceLifecycle({ preserveQueuedDraft: true, silent: true });
   revokeAllTrackedObjectUrls();
@@ -327,11 +332,18 @@ function postRealtimeSignal(type, payload = {}) {
 }
 
 function updateLeaderState(tabId, isLeader) {
-  state.coordination.isLeader = isLeader;
-  state.coordination.leaderId = tabId || '';
-  state.liveConnectionState = isLeader
+  const nextLeaderId = tabId || '';
+  const nextLiveState = isLeader
     ? state.liveConnectionState
     : (state.dataSource === 'api' && state.token ? 'standby' : 'idle');
+  const changed = state.coordination.isLeader !== isLeader
+    || state.coordination.leaderId !== nextLeaderId
+    || state.liveConnectionState !== nextLiveState;
+
+  state.coordination.isLeader = isLeader;
+  state.coordination.leaderId = nextLeaderId;
+  state.liveConnectionState = nextLiveState;
+  return changed;
 }
 
 async function refreshPendingOutboxCount() {
@@ -608,12 +620,15 @@ async function applyRealtimeEvent(kind, payload, { broadcast = false } = {}) {
 }
 
 function setRealtimeFollower(leaderId = '') {
-  if (state.coordination.isLeader) {
+  const wasLeader = state.coordination.isLeader;
+  if (wasLeader) {
     disconnectSocket();
     releaseOutboxOwnership();
   }
-  updateLeaderState(leaderId, false);
-  render();
+  const changed = updateLeaderState(leaderId, false);
+  if (changed) {
+    render();
+  }
 }
 
 async function promoteRealtimeLeader() {
@@ -684,19 +699,23 @@ function handleCoordinationMessage(message) {
 
   if (message.type === 'leader-heartbeat') {
     if (!isRealtimeLeader()) {
-      updateLeaderState(message.payload?.tabId || message.tabId, false);
-      render();
+      const changed = updateLeaderState(message.payload?.tabId || message.tabId, false);
+      if (changed) {
+        render();
+      }
     }
     return;
   }
 
   if (message.type === 'leader-release') {
     if (!isRealtimeLeader() && state.coordination.leaderId === (message.payload?.tabId || message.tabId)) {
-      updateLeaderState('', false);
+      const changed = updateLeaderState('', false);
       window.setTimeout(() => {
         refreshLeadership().catch(() => null);
       }, 50);
-      render();
+      if (changed) {
+        render();
+      }
     }
     return;
   }
@@ -715,7 +734,8 @@ function handleCoordinationMessage(message) {
     refreshPendingOutboxCount().then(() => {
       if (isRealtimeLeader() && state.offline.isOnline) {
         flushPendingOutbox();
-      } else {
+      } else if (state.offline.pendingCount !== Number(message.payload?.pendingCount ?? state.offline.pendingCount)) {
+        state.offline.pendingCount = Number(message.payload?.pendingCount ?? state.offline.pendingCount);
         render();
       }
     }).catch(() => null);
@@ -3374,46 +3394,47 @@ function renderWorkspace() {
   const unreadCount = state.unreadNotificationCount;
   const pendingCount = state.requests.incoming.length + state.requests.outgoing.length;
   const selectedChat = getSelectedChat();
+  const showDetailRail = shouldShowDetailRail();
+  const sectionMeta = getSectionMeta();
+  const compactChatView = state.activeSection === 'chats' && !state.mobileChatListVisible;
 
   return `
     <div class="app-shell workspace-shell">
       <header class="workspace-topbar">
         <div class="topbar-left">
-          <div class="brand-mark">
+          <div class="brand-mark workspace-brand-mark">
             <span class="brand-dot"></span>
             <span>PulseChat</span>
           </div>
-          <div class="mode-pill">
-            <span>${state.dataSource === 'api' ? 'Live API' : 'Demo Workspace'}</span>
+          <div class="workspace-title-block">
+            <strong>${sectionMeta.title}</strong>
+            <span>${sectionMeta.subtitle}</span>
           </div>
-          <div class="status-pill ${state.dataSource === 'api' ? '' : 'warning'}">
-            <span>${state.dataSource === 'api' ? 'Using backend data' : 'Using seeded preview data'}</span>
+          <div class="mode-pill compact ${state.dataSource === 'api' ? '' : 'warning'}">
+            <span>${state.dataSource === 'api' ? 'Live' : 'Demo'}</span>
           </div>
           ${state.dataSource === 'api'
-            ? `<div class="status-pill neutral"><span>${state.liveConnectionState === 'connected' ? 'Realtime connected' : state.liveConnectionState === 'connecting' ? 'Connecting realtime' : 'Realtime paused'}</span></div>`
+            ? `<div class="status-pill neutral compact"><span>${state.liveConnectionState === 'connected' ? 'Realtime connected' : state.liveConnectionState === 'connecting' ? 'Connecting realtime' : 'Realtime paused'}</span></div>`
             : ''}
         </div>
         <div class="topbar-right">
+          ${canToggleDetailsRail()
+            ? `<button class="ghost-button" type="button" data-action="toggle-details">${showDetailRail ? 'Hide details' : 'Show details'}</button>`
+            : ''}
           <button class="ghost-button" type="button" data-action="toggle-theme">${state.theme === 'dark' ? 'Light mode' : 'Dark mode'}</button>
           <a class="ghost-button" href="/api/docs" target="_blank" rel="noreferrer">API docs</a>
           <button class="ghost-button" type="button" data-action="logout">Log out</button>
         </div>
       </header>
       ${renderConnectionBanner()}
-      <div class="workspace-grid workspace-grid-quad">
+      <div class="workspace-grid workspace-grid-quad ${showDetailRail ? 'with-rail' : 'without-rail'} ${compactChatView ? 'show-chat-detail' : 'show-chat-list'}">
         <aside class="sidebar side-panel">
-          <div class="profile-card">
-            <div class="row-head">
-              ${renderAvatar(state.user?.fullName || 'You', state.user?.profileImage, 'large')}
-              <div class="row-body" style="flex: 1;">
-                <h3 class="row-title">${escapeHtml(state.user?.fullName || 'Guest')}</h3>
-                <p class="row-subtitle">@${escapeHtml(state.user?.username || 'demo')}</p>
-                <div class="tag-row">
-                  <span class="tag">${state.user?.role || 'user'}</span>
-                  <span class="tag">${state.user?.isOnline ? 'Online' : 'Away'}</span>
-                </div>
-              </div>
+          <div class="sidebar-brand">
+            <div class="brand-mark compact">
+              <span class="brand-dot"></span>
+              <span>PulseChat</span>
             </div>
+            <p>${state.dataSource === 'api' ? 'Realtime workspace' : 'Preview workspace'}</p>
           </div>
           <div class="nav-stack">
             ${renderNavButton('chats', 'Chats', state.chats.length)}
@@ -3426,25 +3447,63 @@ function renderWorkspace() {
             ${renderNavButton('profile', 'Profile')}
             ${renderNavButton('settings', 'Settings')}
           </div>
+          <button class="profile-card sidebar-account-card" type="button" data-action="switch-section" data-section="profile">
+            <div class="row-head">
+              ${renderAvatar(state.user?.fullName || 'You', state.user?.profileImage)}
+              <div class="row-body" style="flex: 1;">
+                <h3 class="row-title">${escapeHtml(state.user?.fullName || 'Guest')}</h3>
+                <p class="row-subtitle">@${escapeHtml(state.user?.username || 'demo')}</p>
+              </div>
+              <span class="mini-pill">${escapeHtml(state.user?.role || 'user')}</span>
+            </div>
+            <div class="sidebar-account-meta">
+              <span class="caption">${state.user?.isOnline ? 'Online now' : 'Workspace available'}</span>
+              <span class="caption">${state.offline.pendingCount ? `${state.offline.pendingCount} queued` : 'Open profile'}</span>
+            </div>
+          </button>
         </aside>
         <section class="chat-list side-panel">
-          <div class="panel-header compact">
-            <div>
-              <h2>${state.activeSection === 'chats' ? 'Inbox' : capitalize(state.activeSection)}</h2>
-              <p>${state.activeSection === 'chats' ? 'Pinned, unread, and recent conversations in one signal-rich list.' : 'Quick access and lightweight navigation for this space.'}</p>
+          <div class="panel-header compact workspace-list-header">
+            <div class="workspace-list-title">
+              <span class="eyebrow workspace-eyebrow">${sectionMeta.eyebrow}</span>
+              <h2>${sectionMeta.sidebarTitle}</h2>
             </div>
+            ${state.activeSection === 'chats'
+              ? `
+                <div class="segmented-control compact">
+                  ${['all', 'unread', 'pinned'].map((filter) => `
+                    <button
+                      type="button"
+                      class="${state.chatListFilter === filter ? 'is-active' : ''}"
+                      data-action="set-chat-filter"
+                      data-filter="${filter}"
+                    >${capitalize(filter)}</button>
+                  `).join('')}
+                </div>
+              `
+              : ''}
           </div>
           <div class="workspace-search">
-            <input class="workspace-search-input" type="search" placeholder="Search conversations, people, groups..." />
+            <input
+              class="workspace-search-input"
+              type="search"
+              data-role="workspace-search"
+              value="${escapeAttribute(state.workspaceQuery)}"
+              placeholder="${escapeAttribute(sectionMeta.searchPlaceholder)}"
+            />
           </div>
           ${renderSidebarContent(selectedChat)}
         </section>
         <main class="chat-window main-panel">
           ${renderMainPanel()}
         </main>
-        <aside class="info-panel rail-panel">
-          ${renderDetailRail()}
-        </aside>
+        ${showDetailRail
+          ? `
+            <aside class="info-panel rail-panel">
+              ${renderDetailRail()}
+            </aside>
+          `
+          : ''}
       </div>
       ${renderMobileDock(unreadCount, pendingCount)}
       ${renderModal()}
@@ -3541,8 +3600,43 @@ function renderSidebarContent(selectedChat) {
     return renderListSkeleton(5);
   }
 
+  const query = state.workspaceQuery.trim().toLowerCase();
+
+  if (state.activeSection === 'files') {
+    const items = state.filesHub.items.filter((item) => {
+      if (!query) {
+        return true;
+      }
+      return [item.fileName, item.sourceTitle, item.senderName, item.type]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query));
+    }).slice(0, 8);
+
+    return `
+      <div class="list-stack">
+        <div class="title-row">
+          <strong>Recent files</strong>
+          <span class="mini-pill">${items.length}</span>
+        </div>
+        ${items.length
+          ? items.map(renderMiniFileCard).join('')
+          : '<div class="mini-card"><span class="muted-text">No file matches your search.</span></div>'}
+      </div>
+    `;
+  }
+
   if (state.activeSection === 'contacts') {
-    const favorites = state.contacts.filter((item) => item.isFavorite);
+    const favorites = state.contacts.filter((item) => {
+      if (!item.isFavorite) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return [item.fullName, item.username, item.statusMessage]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query));
+    });
     return `
       <div class="list-stack">
         <div class="title-row">
@@ -3556,22 +3650,63 @@ function renderSidebarContent(selectedChat) {
     `;
   }
 
+  if (state.activeSection === 'requests') {
+    const items = (state.requests[state.requestTab] || []).filter((item) => {
+      if (!query) {
+        return true;
+      }
+      return [item.counterpart?.fullName, item.counterpart?.username]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query));
+    });
+
+    return `
+      <div class="list-stack">
+        <div class="title-row">
+          <strong>${state.requestTab === 'incoming' ? 'Incoming' : 'Outgoing'}</strong>
+          <span class="mini-pill">${items.length}</span>
+        </div>
+        ${items.length
+          ? items.map((item) => renderMiniPersonCard(item.counterpart, 'select-contact')).join('')
+          : '<div class="mini-card"><span class="muted-text">No requests match your search.</span></div>'}
+      </div>
+    `;
+  }
+
   if (state.activeSection === 'groups') {
+    const groups = state.groups.filter((group) => {
+      if (!query) {
+        return true;
+      }
+      return [group.name, group.description, group.inviteCode]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query));
+    });
     return `
       <div class="list-stack">
         <div class="title-row">
           <strong>Groups</strong>
-          <span class="mini-pill">${state.groups.length}</span>
+          <span class="mini-pill">${groups.length}</span>
         </div>
-        ${state.groups.length
-          ? state.groups.map((group) => renderMiniGroupCard(group)).join('')
-          : '<div class="mini-card"><span class="muted-text">Your group list will appear here.</span></div>'}
+        ${groups.length
+          ? groups.map((group) => renderMiniGroupCard(group)).join('')
+          : '<div class="mini-card"><span class="muted-text">No groups match your search.</span></div>'}
       </div>
     `;
   }
 
   if (state.activeSection === 'notifications') {
-    const unread = state.notifications.filter((item) => !item.isRead);
+    const unread = state.notifications.filter((item) => {
+      if (item.isRead) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return [item.title, item.body]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query));
+    });
     return `
       <div class="list-stack">
         <div class="title-row">
@@ -3585,14 +3720,16 @@ function renderSidebarContent(selectedChat) {
     `;
   }
 
-  const chats = state.chats.length ? state.chats : demoWorkspace.chats;
+  const chats = getVisibleSidebarChats();
   return `
-    <div class="list-stack">
-      <div class="title-row">
-        <strong>Recent chats</strong>
+    <div class="list-stack conversation-stack">
+      <div class="title-row compact">
+        <strong>${state.chatListFilter === 'all' ? 'Recent chats' : capitalize(state.chatListFilter)}</strong>
         <span class="mini-pill">${chats.length}</span>
       </div>
-      ${chats.map((chat) => renderChatRow(chat, chat.id === selectedChat?.id)).join('')}
+      ${chats.length
+        ? chats.map((chat) => renderChatRow(chat, chat.id === selectedChat?.id)).join('')
+        : '<div class="empty-card compact empty-inline"><h3>No chats found</h3><p>Try another search or filter to surface the right conversation.</p></div>'}
     </div>
   `;
 }
@@ -3674,23 +3811,25 @@ function renderChatRow(chat, isActive) {
       data-action="select-chat"
       data-chat-id="${chat.id}"
     >
-      <div class="row-head">
+      <div class="chat-row-main">
         ${renderAvatar(chat.title, chat.avatarImage)}
-        <div class="row-body" style="flex: 1;">
-          <div class="split-row">
+        <div class="row-body chat-row-copy" style="flex: 1;">
+          <div class="split-row chat-row-top">
             <strong>${escapeHtml(chat.title)}</strong>
             <span class="caption">${relativeTime(chat.lastMessageAt)}</span>
           </div>
-          <span class="row-subtitle ${preview.isTyping ? 'is-typing-text' : ''}">${escapeHtml(preview.text)}</span>
+          <div class="chat-row-bottom">
+            <span class="row-subtitle chat-preview ${preview.isTyping ? 'is-typing-text' : ''}">${escapeHtml(preview.text)}</span>
+            <div class="chat-row-indicators">
+              ${chat.pinned ? '<span class="mini-pill subtle">Pinned</span>' : ''}
+              ${chat.muted ? '<span class="mini-pill subtle">Muted</span>' : ''}
+              ${chat.unreadCount ? `<span class="count-badge">${chat.unreadCount}</span>` : ''}
+            </div>
+          </div>
         </div>
       </div>
-      <div class="row-meta">
-        <span class="mini-pill">${chat.type}</span>
-        <div class="tag-row">
-          ${chat.pinned ? '<span class="tag">Pinned</span>' : ''}
-          ${chat.muted ? '<span class="tag">Muted</span>' : ''}
-          ${chat.unreadCount ? `<span class="count-badge">${chat.unreadCount}</span>` : ''}
-        </div>
+      <div class="chat-row-meta">
+        <span class="mini-pill subtle">${chat.type === 'private' ? 'Direct' : 'Group'}</span>
       </div>
     </button>
   `;
@@ -3822,43 +3961,23 @@ function renderChatsPanel() {
   }
 
   return `
-    <div class="panel-header">
-      <div>
-        <h2>Conversation workspace</h2>
-        <p>Fast, private messaging with smooth live state, contextual details, and focused composition.</p>
-      </div>
-      <div class="segmented-control">
-        <button type="button" class="is-active">Messages</button>
-        <button type="button">Media</button>
-        <button type="button">Files</button>
-      </div>
-    </div>
-    <div class="metrics-grid">
-      <div class="metric-card">
-        <span>Unread</span>
-        <strong>${selectedChat.unreadCount}</strong>
-      </div>
-      <div class="metric-card">
-        <span>Members</span>
-        <strong>${selectedChat.memberCount}</strong>
-      </div>
-      <div class="metric-card">
-        <span>Source</span>
-        <strong>${state.dataSource === 'api' ? 'Live' : 'Demo'}</strong>
-      </div>
-    </div>
-    <section class="chat-layout">
+    <section class="chat-layout chat-layout-focused">
       <div class="chat-header">
         <div class="row-head">
+          ${isMobileViewport() ? '<button class="ghost-button icon-button mobile-chat-back" type="button" data-action="open-chat-list" title="Back to chats">←</button>' : ''}
           ${renderAvatar(selectedChat.title, selectedChat.avatarImage, 'large')}
           <div class="row-body">
             <h3 class="chat-title">${escapeHtml(selectedChat.title)}</h3>
             <span class="row-subtitle">${escapeHtml(selectedChat.subtitle || selectedChat.partnerStatus || '')}</span>
+            <div class="chat-header-tags">
+              ${selectedChat.type === 'private' ? '<span class="mini-pill subtle">Direct chat</span>' : `<span class="mini-pill subtle">${selectedChat.memberCount} members</span>`}
+              ${selectedChat.unreadCount ? `<span class="mini-pill subtle">${selectedChat.unreadCount} unread</span>` : ''}
+              ${e2eeActive ? '<span class="mini-pill subtle secure">Encrypted</span>' : ''}
+            </div>
           </div>
         </div>
         <div class="chat-header-actions">
-          ${e2eeActive ? '<span class="tag">Encrypted</span>' : ''}
-          ${selectedChat.type === 'private' ? '<span class="tag">Private space</span>' : ''}
+          ${canToggleDetailsRail() ? `<button class="ghost-button" type="button" data-action="toggle-details">${shouldShowDetailRail() ? 'Hide details' : 'Show details'}</button>` : ''}
           <button class="ghost-button icon-button" type="button" data-action="composer-emoji" title="Emoji">☺</button>
           <button class="ghost-button icon-button" type="button" data-action="composer-attach" title="Attach">+</button>
         </div>
@@ -3884,7 +4003,7 @@ function renderChatsPanel() {
           <div class="composer-shell">
             <button class="ghost-button icon-button" type="button" data-action="composer-emoji" title="Open emoji picker">☺</button>
             <label class="sr-only" for="message-text">Message</label>
-            <textarea id="message-text" class="composer-input" name="text" placeholder="Write a message..." rows="3"></textarea>
+            <textarea id="message-text" class="composer-input" name="text" placeholder="Message ${escapeAttribute(selectedChat.title)}" rows="3"></textarea>
             <button class="ghost-button icon-button" type="button" data-action="composer-attach" title="Add attachment">+</button>
             <button
               class="ghost-button icon-button ${voiceState === 'recording' ? 'is-recording' : ''} ${voiceState === 'unsupported' ? 'is-disabled' : ''}"
@@ -3894,11 +4013,10 @@ function renderChatsPanel() {
               ${voiceState === 'unsupported' ? 'disabled' : ''}
             >${voiceState === 'recording' ? '■' : '🎙'}</button>
           </div>
-          <div class="composer-actions">
-            <div class="tag-row">
-              <span class="tag">Seen status</span>
-              <span class="tag">Reply-ready</span>
-              <span class="tag">${voiceState === 'recording' ? `Recording ${formatDuration(Math.ceil(state.voiceRecorder.durationMs / 1000))}` : voiceState === 'queued' ? 'Voice queued' : voiceState === 'failed' ? 'Voice failed' : voiceState === 'unsupported' ? 'Voice unsupported' : state.voiceDraft ? 'Voice preview ready' : 'Voice-ready'}</span>
+          <div class="composer-actions composer-footer">
+            <div class="composer-context">
+              <span class="caption">${getComposerStatusText(voiceState)}</span>
+              ${state.offline.pendingCount ? `<span class="mini-pill subtle">${state.offline.pendingCount} queued</span>` : ''}
             </div>
             <button class="primary-button" type="submit" ${voiceState === 'recording' || voiceState === 'requesting_permission' || voiceState === 'sending' || state.isSubmitting ? 'disabled' : ''}>Send message</button>
           </div>
@@ -4098,14 +4216,14 @@ function renderMessage(message) {
           ? `<div class="message-reactions">${reactions.map((item) => `<span class="reaction-chip">${escapeHtml(item.emoji)} ${item.count}</span>`).join('')}</div>`
           : ''}
         <div class="request-actions message-actions-row">
-          <button class="chip-button" type="button" data-action="reply-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reply</button>
-          <button class="chip-button" type="button" data-action="react-message" data-message-id="${message.id}" style="padding: 8px 12px;">Reaction</button>
+          <button class="chip-button compact" type="button" data-action="reply-message" data-message-id="${message.id}">Reply</button>
+          <button class="chip-button compact" type="button" data-action="react-message" data-message-id="${message.id}">React</button>
           ${message.mine && message.type === 'text' && !message.isEncrypted
-            ? `<button class="chip-button" type="button" data-action="edit-message" data-message-id="${message.id}" style="padding: 8px 12px;">Edit</button>`
+            ? `<button class="chip-button compact" type="button" data-action="edit-message" data-message-id="${message.id}">Edit</button>`
             : ''}
-          <button class="chip-button" type="button" data-action="delete-message" data-message-id="${message.id}" style="padding: 8px 12px;">Delete</button>
+          <button class="chip-button compact" type="button" data-action="delete-message" data-message-id="${message.id}">Delete</button>
           ${message.deliveryState === 'failed'
-            ? `<button class="chip-button" type="button" data-action="retry-message" data-message-id="${message.id}" style="padding: 8px 12px;">Retry</button>`
+            ? `<button class="chip-button compact" type="button" data-action="retry-message" data-message-id="${message.id}">Retry</button>`
             : ''}
         </div>
         <div class="message-meta">
@@ -4651,6 +4769,13 @@ function renderDetailRail() {
   const chat = getSelectedChat();
   return `
     <div class="detail-panel">
+      <div class="detail-rail-header">
+        <div>
+          <strong>Details</strong>
+          <span class="caption">Context for the active workspace item</span>
+        </div>
+        <button class="ghost-button" type="button" data-action="toggle-details">Hide</button>
+      </div>
       <div class="profile-card">
         <strong>Conversation details</strong>
         ${chat ? renderRailChat(chat) : '<p class="helper-text">Select a chat to see participant details and activity summary.</p>'}
@@ -4747,6 +4872,160 @@ function renderAvatar(name, image, sizeClass = '') {
     ? `<img src="${image}" alt="${escapeAttribute(name)}" />`
     : `<span>${escapeHtml(initials(name))}</span>`;
   return `<div class="avatar ${sizeClass}">${content}</div>`;
+}
+
+function getSectionMeta() {
+  const map = {
+    chats: {
+      title: 'Inbox',
+      subtitle: 'Focused conversations and quick triage.',
+      sidebarTitle: 'Conversations',
+      eyebrow: 'Workspace',
+      searchPlaceholder: 'Search chats or people',
+    },
+    files: {
+      title: 'Files hub',
+      subtitle: 'Shared media and documents across chats.',
+      sidebarTitle: 'Files',
+      eyebrow: 'Library',
+      searchPlaceholder: 'Search files or media',
+    },
+    contacts: {
+      title: 'Contacts',
+      subtitle: 'People, favorites, and direct access.',
+      sidebarTitle: 'People',
+      eyebrow: 'Directory',
+      searchPlaceholder: 'Search contacts',
+    },
+    requests: {
+      title: 'Requests',
+      subtitle: 'Pending connection requests and actions.',
+      sidebarTitle: 'Requests',
+      eyebrow: 'Queue',
+      searchPlaceholder: 'Search requests',
+    },
+    groups: {
+      title: 'Groups',
+      subtitle: 'Rooms, members, and invites.',
+      sidebarTitle: 'Groups',
+      eyebrow: 'Collaboration',
+      searchPlaceholder: 'Search groups',
+    },
+    notifications: {
+      title: 'Notifications',
+      subtitle: 'Recent updates and alerts.',
+      sidebarTitle: 'Notifications',
+      eyebrow: 'Activity',
+      searchPlaceholder: 'Search notifications',
+    },
+    admin: {
+      title: 'Admin',
+      subtitle: 'Operational overview and moderation.',
+      sidebarTitle: 'Admin',
+      eyebrow: 'Control',
+      searchPlaceholder: 'Search admin data',
+    },
+    profile: {
+      title: 'Profile',
+      subtitle: 'Identity and public details.',
+      sidebarTitle: 'Profile',
+      eyebrow: 'Account',
+      searchPlaceholder: 'Search profile settings',
+    },
+    settings: {
+      title: 'Settings',
+      subtitle: 'Privacy and workspace preferences.',
+      sidebarTitle: 'Settings',
+      eyebrow: 'Preferences',
+      searchPlaceholder: 'Search settings',
+    },
+  };
+
+  return map[state.activeSection] || map.chats;
+}
+
+function getVisibleSidebarChats() {
+  const chats = (state.chats.length ? state.chats : demoWorkspace.chats).slice();
+  const query = state.workspaceQuery.trim().toLowerCase();
+
+  const filtered = chats.filter((chat) => {
+    if (state.chatListFilter === 'unread' && !chat.unreadCount) {
+      return false;
+    }
+    if (state.chatListFilter === 'pinned' && !chat.pinned) {
+      return false;
+    }
+    if (!query) {
+      return true;
+    }
+    const preview = getChatPreviewText(chat).text.toLowerCase();
+    return [chat.title, chat.subtitle, chat.partnerName, preview]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query));
+  });
+
+  return filtered.sort((left, right) => {
+    if (left.pinned !== right.pinned) {
+      return left.pinned ? -1 : 1;
+    }
+    if (Boolean(left.unreadCount) !== Boolean(right.unreadCount)) {
+      return left.unreadCount ? -1 : 1;
+    }
+    return new Date(right.lastMessageAt || 0).getTime() - new Date(left.lastMessageAt || 0).getTime();
+  });
+}
+
+function getComposerStatusText(voiceState) {
+  if (voiceState === 'recording') {
+    return `Recording ${formatDuration(Math.ceil(state.voiceRecorder.durationMs / 1000))}`;
+  }
+  if (voiceState === 'queued') {
+    return 'Voice note queued for delivery';
+  }
+  if (voiceState === 'failed') {
+    return 'Voice note failed. Retry when ready.';
+  }
+  if (voiceState === 'unsupported') {
+    return 'Voice recording is unavailable in this browser';
+  }
+  if (state.replyDraft) {
+    return 'Reply ready';
+  }
+  if (state.voiceDraft) {
+    return 'Voice preview ready';
+  }
+  return state.offline.isOnline ? 'Live conversation' : 'Offline mode enabled';
+}
+
+function canToggleDetailsRail() {
+  return window.innerWidth > 1360
+    && !isMobileViewport()
+    && ['chats', 'files', 'contacts', 'groups', 'notifications', 'admin', 'profile', 'settings'].includes(state.activeSection);
+}
+
+function shouldShowDetailRail() {
+  if (!canToggleDetailsRail()) {
+    return false;
+  }
+  return state.detailRailOpen;
+}
+
+function isMobileViewport() {
+  return window.innerWidth <= 960;
+}
+
+function handleViewportChange() {
+  if (isMobileViewport()) {
+    state.detailRailOpen = false;
+  } else if (window.innerWidth > 1360 && canToggleDetailsRail()) {
+    state.detailRailOpen = true;
+  }
+
+  if (!isMobileViewport()) {
+    state.mobileChatListVisible = true;
+  }
+
+  render();
 }
 
 function renderToasts() {
@@ -4895,9 +5174,25 @@ async function handleClick(event) {
       cleanupVoiceOnContextChange(null);
     }
     state.activeSection = target.dataset.section;
+    state.workspaceQuery = '';
+    if (state.activeSection === 'chats') {
+      state.mobileChatListVisible = true;
+    }
     if (state.activeSection === 'files') {
       await loadFilesHub({ silent: true });
     }
+    render();
+    return;
+  }
+
+  if (action === 'toggle-details') {
+    state.detailRailOpen = !state.detailRailOpen;
+    render();
+    return;
+  }
+
+  if (action === 'set-chat-filter') {
+    state.chatListFilter = target.dataset.filter || 'all';
     render();
     return;
   }
@@ -4957,6 +5252,12 @@ async function handleClick(event) {
     window.setTimeout(() => {
       document.getElementById('message-text')?.focus();
     }, 0);
+    return;
+  }
+
+  if (action === 'open-chat-list') {
+    state.mobileChatListVisible = true;
+    render();
     return;
   }
 
@@ -5061,6 +5362,9 @@ async function handleClick(event) {
     cleanupVoiceOnContextChange(target.dataset.chatId || null);
     state.activeSection = 'chats';
     state.selectedChatId = target.dataset.chatId || state.selectedChatId;
+    if (isMobileViewport()) {
+      state.mobileChatListVisible = false;
+    }
     await loadChatMessages(state.selectedChatId);
     render();
     return;
@@ -5071,6 +5375,9 @@ async function handleClick(event) {
     state.activeSection = 'chats';
     state.replyDraft = null;
     state.selectedChatId = target.dataset.chatId;
+    if (isMobileViewport()) {
+      state.mobileChatListVisible = false;
+    }
     await loadChatMessages(state.selectedChatId);
     render();
     return;
@@ -5165,6 +5472,20 @@ let typingTimer = null;
 
 function handleInput(event) {
   const target = event.target;
+
+  if (target.dataset.role === 'workspace-search') {
+    const nextValue = String(target.value || '');
+    state.workspaceQuery = nextValue;
+    render();
+    window.requestAnimationFrame(() => {
+      const searchInput = document.querySelector('[data-role="workspace-search"]');
+      if (searchInput) {
+        searchInput.focus();
+        searchInput.setSelectionRange(nextValue.length, nextValue.length);
+      }
+    });
+    return;
+  }
 
   if (target.id !== 'message-text' || !state.selectedChatId || state.dataSource !== 'api') {
     return;
@@ -5596,6 +5917,9 @@ async function openChatWithContact(contactId) {
   cleanupVoiceOnContextChange(chat.id);
   state.selectedChatId = chat.id;
   state.activeSection = 'chats';
+  if (isMobileViewport()) {
+    state.mobileChatListVisible = false;
+  }
   pushToast('Chat ready', `Opened a conversation with ${contact.fullName}.`, 'success');
   render();
 }
