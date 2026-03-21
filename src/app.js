@@ -28,6 +28,7 @@ const inviteRoutes = require('./modules/invites/invite.routes');
 const callRoutes = require('./modules/calls/call.routes');
 
 const app = express();
+const publicDir = path.resolve(process.cwd(), 'public');
 
 app.use(helmet());
 app.use(cors({ origin: env.clientUrl, credentials: true }));
@@ -38,6 +39,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(mongoSanitize());
 app.use(apiRateLimit);
 app.use(`/${env.uploadDir}`, express.static(path.resolve(process.cwd(), env.uploadDir)));
+app.use(express.static(publicDir));
 
 app.get('/health', (req, res) => {
   res.json({
@@ -68,6 +70,23 @@ app.use('/api/v1/invites', inviteRoutes);
 app.use('/api/v1/calls', callRoutes);
 
 setupSwagger(app);
+
+app.get('*', (req, res, next) => {
+  if (req.method !== 'GET') {
+    next();
+    return;
+  }
+
+  if (req.path === '/health'
+    || req.path.startsWith('/api/')
+    || req.path.startsWith('/docs')
+    || req.path.startsWith(`/${env.uploadDir}`)) {
+    next();
+    return;
+  }
+
+  res.sendFile(path.join(publicDir, 'index.html'));
+});
 
 app.use(notFoundHandler);
 app.use(errorHandler);
