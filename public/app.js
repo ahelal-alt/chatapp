@@ -4,6 +4,17 @@ const appState = {
   toast: null,
   invite: null,
   inviteError: '',
+  mediaViewer: {
+    open: false,
+    loading: false,
+    error: '',
+    item: null,
+  },
+  callUi: {
+    current: null,
+    incoming: null,
+    history: [],
+  },
   detailsDrawer: {
     open: false,
     kind: '',
@@ -33,6 +44,7 @@ const appState = {
     groups: [],
     activeGroup: null,
     files: [],
+    search: null,
     notifications: [],
     profile: null,
     privacy: null,
@@ -236,6 +248,9 @@ async function loadAppSection(section, id) {
       case 'files':
         await loadFiles();
         break;
+      case 'search':
+        await loadSearch();
+        break;
       case 'notifications':
         await loadNotifications(true);
         break;
@@ -247,6 +262,9 @@ async function loadAppSection(section, id) {
         break;
       case 'security':
         await loadSecurity();
+        break;
+      case 'calls':
+        await loadCalls();
         break;
       case 'admin':
         if (appState.data.me?.role === 'admin') {
@@ -395,6 +413,21 @@ async function loadFiles() {
   appState.data.files = Array.isArray(files) ? files : [];
 }
 
+async function loadSearch() {
+  const q = String(appState.forms.search?.q || '').trim();
+  if (!q) {
+    appState.data.search = {
+      query: '',
+      results: [],
+      grouped: {},
+      meta: null,
+    };
+    return;
+  }
+
+  appState.data.search = await api(`/search?q=${encodeURIComponent(q)}&limit=8`);
+}
+
 async function loadNotifications(force = false) {
   if (!force && appState.data.notifications.length) {
     appState.unreadCount = appState.data.notifications.filter((item) => !item.isRead).length;
@@ -419,6 +452,11 @@ async function loadPrivacy() {
 
 async function loadSecurity() {
   appState.data.sessions = await api('/auth/sessions');
+}
+
+async function loadCalls() {
+  const result = await api('/calls?limit=20');
+  appState.callUi.history = Array.isArray(result) ? result : [];
 }
 
 async function loadAdmin() {
@@ -535,6 +573,11 @@ function connectSocket() {
         chatId: String(appState.data.activeChat.id || appState.data.activeChat._id),
       });
     }
+    if (appState.callUi.current?.id) {
+      emitSocketAck('call:sync', {
+        callId: appState.callUi.current.id,
+      }).catch(() => {});
+    }
   });
 
   socket.on('message:new', (message) => {
@@ -617,6 +660,57 @@ function connectSocket() {
     showToast(message || 'A realtime action failed.');
   });
 
+  socket.on('call:ringing', ({ call, initiatorUserId }) => {
+    mergeCallSnapshot(call);
+    if (String(initiatorUserId || '') !== String(appState.data.me?._id || appState.data.me?.id || '')) {
+      appState.callUi.incoming = call;
+    }
+    render();
+  });
+
+  socket.on('call:accepted', ({ call }) => {
+    mergeCallSnapshot(call);
+    render();
+  });
+
+  socket.on('call:rejected', ({ call }) => {
+    mergeCallSnapshot(call);
+    if (appState.callUi.incoming?.id === call.id) {
+      appState.callUi.incoming = null;
+    }
+    render();
+  });
+
+  socket.on('call:joined', ({ call }) => {
+    mergeCallSnapshot(call);
+    render();
+  });
+
+  socket.on('call:state', ({ call }) => {
+    mergeCallSnapshot(call);
+    render();
+  });
+
+  socket.on('call:left', ({ call }) => {
+    mergeCallSnapshot(call);
+    if (['ended', 'missed'].includes(call.status)) {
+      appState.callUi.incoming = null;
+    }
+    render();
+  });
+
+  socket.on('call:ended', ({ call }) => {
+    mergeCallSnapshot(call);
+    appState.callUi.incoming = null;
+    render();
+  });
+
+  socket.on('call:missed', ({ call }) => {
+    mergeCallSnapshot(call);
+    appState.callUi.incoming = null;
+    render();
+  });
+
   appState.socket = socket;
 }
 
@@ -640,6 +734,47 @@ function closeDetailsDrawer(silent = false) {
   if (!silent) {
     render();
   }
+}
+
+function closeMediaViewer(silent = false) {
+  appState.mediaViewer = {
+    open: false,
+    loading: false,
+    error: '',
+    item: null,
+  };
+
+  if (!silent) {
+    render();
+  }
+}
+
+function mergeCallSnapshot(call) {
+  if (!call?.id) {
+    return;
+  }
+
+  appState.callUi.current = call;
+  appState.callUi.history = [
+    call,
+    ...appState.callUi.history.filter((item) => String(item.id || item._id) !== String(call.id)),
+  ].slice(0, 20);
+}
+
+async function emitSocketAck(eventName, payload) {
+  if (!appState.socket) {
+    throw new Error('Realtime connection is unavailable.');
+  }
+
+  return new Promise((resolve, reject) => {
+    appState.socket.emit(eventName, payload, (response = {}) => {
+      if (response.success) {
+        resolve(response.data);
+      } else {
+        reject(new Error(response.message || 'Socket action failed.'));
+      }
+    });
+  });
 }
 
 async function openPrivateChatDetails() {
@@ -679,6 +814,25 @@ async function openGroupDetails(groupId) {
     appState.detailsDrawer.error = error.message || 'Unable to load group details right now.';
   } finally {
     appState.detailsDrawer.loading = false;
+    render();
+  }
+}
+
+async function openMediaViewer(messageId) {
+  appState.mediaViewer = {
+    open: true,
+    loading: true,
+    error: '',
+    item: null,
+  };
+  render();
+
+  try {
+    appState.mediaViewer.item = await api(`/messages/${messageId}/media`);
+  } catch (error) {
+    appState.mediaViewer.error = error.message || 'Unable to load media details.';
+  } finally {
+    appState.mediaViewer.loading = false;
     render();
   }
 }
@@ -780,6 +934,12 @@ function onDocumentClick(event) {
     return;
   }
 
+  if (action === 'open-search-result') {
+    event.preventDefault();
+    openSearchResult(value);
+    return;
+  }
+
   if (action === 'attach-file') {
     event.preventDefault();
     document.getElementById('composer-file-input')?.click();
@@ -844,6 +1004,54 @@ function onDocumentClick(event) {
   if (action === 'admin-user-status') {
     event.preventDefault();
     updateAdminUserStatus(value, actionTarget.dataset.enabled === 'true');
+    return;
+  }
+
+  if (action === 'open-media') {
+    event.preventDefault();
+    openMediaViewer(value);
+    return;
+  }
+
+  if (action === 'close-media') {
+    event.preventDefault();
+    closeMediaViewer();
+    return;
+  }
+
+  if (action === 'start-call') {
+    event.preventDefault();
+    startCall(actionTarget.dataset.kind || 'voice');
+    return;
+  }
+
+  if (action === 'accept-call') {
+    event.preventDefault();
+    acceptIncomingCall(value);
+    return;
+  }
+
+  if (action === 'reject-call') {
+    event.preventDefault();
+    rejectIncomingCall(value);
+    return;
+  }
+
+  if (action === 'leave-call') {
+    event.preventDefault();
+    leaveCurrentCall(value);
+    return;
+  }
+
+  if (action === 'end-call') {
+    event.preventDefault();
+    endCurrentCall(value);
+    return;
+  }
+
+  if (action === 'open-call-panel') {
+    event.preventDefault();
+    navigate(`/app/calls/${value || ''}`);
     return;
   }
 }
@@ -939,6 +1147,9 @@ async function onDocumentSubmit(event) {
         break;
       case 'search-files':
         await loadFiles();
+        break;
+      case 'search':
+        await loadSearch();
         break;
       case 'invite-register':
         await submitInviteRegister(data);
@@ -1265,19 +1476,7 @@ async function openNotification(notificationId) {
   }
 
   const routeHint = detail.route || detail.routeHint;
-  if (routeHint?.section === 'chats' && routeHint.params?.chatId) {
-    navigate(`/app/messages/${routeHint.params.chatId}`);
-    return;
-  }
-  if (routeHint?.section === 'requests') {
-    navigate('/app/requests');
-    return;
-  }
-  if (routeHint?.section === 'groups' && routeHint.params?.groupId) {
-    navigate(`/app/groups/${routeHint.params.groupId}`);
-    return;
-  }
-  navigate('/app/notifications');
+  navigateFromRouteHint(routeHint);
 }
 
 async function toggleContactFavorite(userId, isFavorite) {
@@ -1359,6 +1558,111 @@ async function clearActiveChat() {
   refreshChatPreview(chatId, null);
   showToast('Chat history cleared for your account.');
   closeDetailsDrawer(true);
+  render();
+}
+
+async function openSearchResult(indexValue) {
+  const index = Number(indexValue);
+  const result = appState.data.search?.results?.[index];
+  if (!result) {
+    return;
+  }
+
+  if (result.entityType === 'file') {
+    await openMediaViewer(result.entityId);
+    return;
+  }
+
+  navigateFromRouteHint(result.routeHint);
+}
+
+function navigateFromRouteHint(routeHint) {
+  if (!routeHint) {
+    navigate('/app/search');
+    return;
+  }
+
+  if ((routeHint.section === 'chats' || routeHint.section === 'messages') && routeHint.params?.chatId) {
+    navigate(`/app/messages/${routeHint.params.chatId}`);
+    return;
+  }
+  if (routeHint.section === 'requests') {
+    navigate('/app/requests');
+    return;
+  }
+  if (routeHint.section === 'groups' && routeHint.params?.groupId) {
+    navigate(`/app/groups/${routeHint.params.groupId}`);
+    return;
+  }
+  if (routeHint.section === 'files') {
+    navigate('/app/files');
+    return;
+  }
+  if (routeHint.section === 'admin') {
+    navigate('/app/admin');
+    return;
+  }
+  if (routeHint.section === 'contacts') {
+    navigate('/app/contacts');
+    return;
+  }
+  if (routeHint.section === 'notifications') {
+    navigate('/app/notifications');
+    return;
+  }
+  navigate('/app/search');
+}
+
+async function startCall(kind = 'voice') {
+  const chatId = String(appState.data.activeChat?.id || appState.data.activeChat?._id || '');
+  if (!chatId) {
+    showToast('Select a conversation first.');
+    return;
+  }
+
+  const call = await emitSocketAck('call:create', {
+    chatId,
+    type: kind,
+  });
+
+  mergeCallSnapshot(call);
+  await emitSocketAck('call:join', {
+    callId: call.id,
+  });
+  showToast('Calling started.');
+  navigate(`/app/calls/${call.id}`);
+}
+
+async function acceptIncomingCall(callId) {
+  const accepted = await emitSocketAck('call:accept', { callId });
+  mergeCallSnapshot(accepted);
+  await emitSocketAck('call:join', { callId });
+  appState.callUi.incoming = null;
+  navigate(`/app/calls/${callId}`);
+}
+
+async function rejectIncomingCall(callId) {
+  const rejected = await emitSocketAck('call:reject', { callId });
+  mergeCallSnapshot(rejected);
+  appState.callUi.incoming = null;
+  showToast('Call declined.');
+}
+
+async function leaveCurrentCall(callId) {
+  const left = await emitSocketAck('call:leave', { callId });
+  mergeCallSnapshot(left);
+  if (['ended', 'missed'].includes(left.status)) {
+    appState.callUi.incoming = null;
+  }
+  showToast('You left the call.');
+  render();
+}
+
+async function endCurrentCall(callId) {
+  const ended = await emitSocketAck('call:end', { callId });
+  mergeCallSnapshot(ended);
+  appState.callUi.incoming = null;
+  showToast('Call ended.');
   render();
 }
 
@@ -1570,6 +1874,8 @@ function isCurrentSection(name) {
 function render() {
   root.innerHTML = `
     ${renderCurrentView()}
+    ${renderMediaViewer()}
+    ${renderIncomingCallBanner()}
     ${appState.toast ? `<div class="toast">${escapeHtml(appState.toast)}</div>` : ''}
   `;
 }
@@ -1882,6 +2188,7 @@ function renderWorkspace() {
 function renderSidebar() {
   const navItems = [
     ['messages', 'chat_bubble', 'Messages'],
+    ['search', 'search', 'Search'],
     ['contacts', 'group', 'Contacts'],
     ['requests', 'person_add', 'Requests'],
     ['groups', 'forum', 'Groups'],
@@ -1923,6 +2230,29 @@ function renderRail() {
   switch (appState.route.section) {
     case 'messages':
       return renderMessagesRail();
+    case 'search':
+      return `
+        <aside class="rail">
+          <div class="rail__header">
+            <div class="rail__heading">
+              <h1 class="headline">Search</h1>
+            </div>
+            <div class="muted">One place for people, chats, files, notifications, reports, and requests.</div>
+          </div>
+          <div class="rail__body">
+            <div class="card card--soft">
+              <h3 class="card__title">Search tips</h3>
+              <div class="stack" style="gap:0.55rem;">
+                <div class="pill">Users</div>
+                <div class="pill">Chats</div>
+                <div class="pill">Files</div>
+                <div class="pill">Notifications</div>
+                <div class="pill">Reports</div>
+              </div>
+            </div>
+          </div>
+        </aside>
+      `;
     case 'contacts':
       return renderContactsRail();
     case 'requests':
@@ -2166,6 +2496,8 @@ function renderPanel() {
       return renderGroupsPanel();
     case 'files':
       return renderFilesPanel();
+    case 'search':
+      return renderSearchPanel();
     case 'notifications':
       return renderNotificationsPanel();
     case 'profile':
@@ -2174,6 +2506,8 @@ function renderPanel() {
       return renderPrivacyPanel();
     case 'security':
       return renderSecurityPanel();
+    case 'calls':
+      return renderCallsPanel();
     case 'admin':
       return renderAdminPanel();
     default:
