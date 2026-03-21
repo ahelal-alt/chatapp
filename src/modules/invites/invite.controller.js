@@ -20,6 +20,7 @@ const createInvite = asyncHandler(async (req, res) => {
   res.status(201).json(new ApiResponse('Invite created successfully', {
     invite: result.invite,
     inviteUrl: result.inviteUrl,
+    emailDelivery: result.emailDelivery,
     ...(result.devOnly ? { devOnly: result.devOnly } : {}),
   }));
 });
@@ -34,6 +35,7 @@ const resendInvite = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Invite resent successfully', {
     invite: result.invite,
     inviteUrl: result.inviteUrl,
+    emailDelivery: result.emailDelivery,
     ...(result.devOnly ? { devOnly: result.devOnly } : {}),
   }));
 });

@@ -53,7 +53,7 @@ const changePassword = asyncHandler(async (req, res) => {
 const forgotPassword = asyncHandler(async (req, res) => {
   setNoStore(res);
   const data = await authService.forgotPassword(req.body, getRequestMeta(req));
-  res.json(new ApiResponse(data.message, data.devOnly || null));
+  res.json(new ApiResponse(data.message, data));
 });
 
 const resetPassword = asyncHandler(async (req, res) => {
@@ -71,7 +71,7 @@ const verifyEmail = asyncHandler(async (req, res) => {
 const resendVerification = asyncHandler(async (req, res) => {
   setNoStore(res);
   const data = await authService.resendVerification(req.user?._id, req.body, getRequestMeta(req));
-  res.json(new ApiResponse(data.message, data.devOnly || null));
+  res.json(new ApiResponse(data.message, data));
 });
 
 const logoutAll = asyncHandler(async (req, res) => {

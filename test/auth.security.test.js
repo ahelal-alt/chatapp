@@ -6,6 +6,7 @@ const User = require('../src/modules/users/user.model');
 const PrivacySettings = require('../src/modules/privacy/privacy.model');
 const AuthSession = require('../src/modules/auth/authSession.model');
 const authService = require('../src/modules/auth/auth.service');
+const mailer = require('../src/utils/mailer');
 const { evaluatePassword, hashPassword, comparePassword } = require('../src/utils/password');
 const { authenticate } = require('../src/middleware/auth.middleware');
 const { signAccessToken } = require('../src/utils/token');
@@ -61,6 +62,8 @@ test.beforeEach(() => {
     authSessionCreate: AuthSession.create,
     authSessionUpdateMany: AuthSession.updateMany,
     authSessionFindOneAndUpdate: AuthSession.findOneAndUpdate,
+    sendVerificationEmail: mailer.sendVerificationEmail,
+    sendPasswordResetEmail: mailer.sendPasswordResetEmail,
   };
 });
 
@@ -74,6 +77,8 @@ test.afterEach(() => {
   AuthSession.create = originals.authSessionCreate;
   AuthSession.updateMany = originals.authSessionUpdateMany;
   AuthSession.findOneAndUpdate = originals.authSessionFindOneAndUpdate;
+  mailer.sendVerificationEmail = originals.sendVerificationEmail;
+  mailer.sendPasswordResetEmail = originals.sendPasswordResetEmail;
 });
 
 test('password helper hashes and verifies secrets', async () => {
@@ -115,6 +120,11 @@ test('register creates a verification-pending account with normalized identifier
   };
   PrivacySettings.create = async () => ({});
   AuthSession.create = async () => ({ _id: 'session-1' });
+  let sentVerificationPayload = null;
+  mailer.sendVerificationEmail = async (payload) => {
+    sentVerificationPayload = payload;
+    return { status: 'sent', configured: true };
+  };
 
   const result = await authService.register({
     fullName: 'New User',
@@ -129,6 +139,9 @@ test('register creates a verification-pending account with normalized identifier
   assert.equal(result.user.username, 'newuser');
   assert.equal(result.user.accountStatus, 'pending_verification');
   assert.notEqual(createdUser.passwordHash, 'Correct horse battery staple 42!');
+  assert.equal(result.emailDelivery.status, 'sent');
+  assert.equal(sentVerificationPayload.to, 'new.user@example.com');
+  assert.ok(sentVerificationPayload.token);
 });
 
 test('login keeps invalid-credential messaging generic', async () => {
@@ -162,6 +175,35 @@ test('verify email activates the account and issues tokens', async () => {
   assert.equal(result.user.accountStatus, 'active');
   assert.ok(result.tokens.accessToken);
   assert.ok(result.tokens.refreshToken);
+});
+
+test('forgot password sends reset email metadata for known accounts', async () => {
+  const user = createMockUser({
+    email: 'reset@example.com',
+    emailNormalized: 'reset@example.com',
+    isVerified: true,
+    isEmailVerified: true,
+    accountStatus: 'active',
+  });
+
+  User.findOne = () => ({
+    select: async () => user,
+  });
+
+  let sentResetPayload = null;
+  mailer.sendPasswordResetEmail = async (payload) => {
+    sentResetPayload = payload;
+    return { status: 'sent', configured: true };
+  };
+
+  const result = await authService.forgotPassword({
+    email: 'reset@example.com',
+  }, { ipAddress: '127.0.0.1', userAgent: 'test' });
+
+  assert.equal(result.message, 'If the email exists, reset instructions will be sent.');
+  assert.equal(result.emailDelivery.status, 'sent');
+  assert.equal(sentResetPayload.to, 'reset@example.com');
+  assert.ok(sentResetPayload.token);
 });
 
 test('auth middleware rejects tokens after session version changes', async () => {

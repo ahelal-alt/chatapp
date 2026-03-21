@@ -105,7 +105,15 @@ function clearSession() {
     refreshToken: '',
   };
   appState.data.me = null;
+  appState.callUi = {
+    current: null,
+    incoming: null,
+    history: [],
+  };
+  appState.data.search = null;
   disconnectSocket();
+  closeDetailsDrawer(true);
+  closeMediaViewer(true);
   persistSession();
 }
 
@@ -173,6 +181,7 @@ function navigate(path, replace = false) {
 async function handleRouteChange(initial = false) {
   appState.route = parseRoute();
   closeDetailsDrawer(true);
+  closeMediaViewer(true);
 
   if (appState.route.name === 'app') {
     const okay = await ensureAuthenticated();
@@ -265,6 +274,10 @@ async function loadAppSection(section, id) {
         break;
       case 'calls':
         await loadCalls();
+        if (id) {
+          const call = await api(`/calls/${id}`);
+          mergeCallSnapshot(call);
+        }
         break;
       case 'admin':
         if (appState.data.me?.role === 'admin') {
@@ -2193,6 +2206,7 @@ function renderSidebar() {
     ['requests', 'person_add', 'Requests'],
     ['groups', 'forum', 'Groups'],
     ['files', 'folder_open', 'Files'],
+    ['calls', 'call', 'Calls'],
     ['notifications', 'notifications', 'Notifications'],
     ['profile', 'account_circle', 'Profile'],
     ['privacy', 'shield', 'Privacy'],
@@ -2541,7 +2555,7 @@ function renderMessagesPanel() {
         </div>
         <div class="panel__header-actions">
           <button class="icon-button" title="Search in conversation"><span class="material-symbols-outlined">search</span></button>
-          <button class="icon-button" title="Call"><span class="material-symbols-outlined">call</span></button>
+          <button class="icon-button" type="button" data-action="start-call" data-kind="voice" title="Call"><span class="material-symbols-outlined">call</span></button>
           ${chat.type === 'private' ? '<button class="icon-button" type="button" data-action="open-chat-details" title="Details"><span class="material-symbols-outlined">info</span></button>' : ''}
           <button class="icon-button" data-action="section" data-value="files" title="Files"><span class="material-symbols-outlined">folder_open</span></button>
           <button class="icon-button" data-action="section" data-value="notifications" title="Notifications"><span class="material-symbols-outlined">notifications</span></button>
@@ -2807,12 +2821,83 @@ function renderFilesPanel() {
                   ${file.pages ? `<span>${escapeHtml(`${file.pages} pages`)}</span>` : ''}
                 </div>
                 <div class="topbar__actions">
-                  ${file.mediaUrl ? `<a class="surface-button" href="${escapeHtml(file.mediaUrl)}" target="_blank" rel="noreferrer">Open</a>` : ''}
+                  <button class="surface-button" type="button" data-action="open-media" data-value="${escapeHtml(file._id || file.id || '')}">Preview</button>
                   <button class="ghost-button" type="button" data-action="open-chat" data-value="${escapeHtml(file.chatId || '')}">Open chat</button>
                 </div>
               </article>
             `).join('') : '<div class="empty-state">No files match this view.</div>'}
           </div>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderSearchPanel() {
+  const search = appState.data.search || { query: '', results: [], grouped: {}, meta: null };
+  const values = appState.forms.search || {};
+  const groups = [
+    ['users', 'Users'],
+    ['chats', 'Chats'],
+    ['groups', 'Groups'],
+    ['messages', 'Messages'],
+    ['files', 'Files'],
+    ['notifications', 'Notifications'],
+    ['reports', 'Reports'],
+    ['contactRequests', 'Contact requests'],
+  ];
+
+  return `
+    <section class="panel">
+      <div class="panel__header">
+        <div class="panel__header-main">
+          <div>
+            <h2 class="headline" style="font-size:1.25rem;margin:0;">Unified search</h2>
+            <div class="muted">Search the whole product from one place.</div>
+          </div>
+        </div>
+      </div>
+      <div class="panel__body">
+        <div class="page">
+          <form class="card form" data-form="search">
+            <div class="section-toolbar">
+              <input class="input" type="search" name="q" value="${escapeHtml(values.q || search.query || '')}" placeholder="Search people, chats, files, notifications, reports..." />
+              <button class="primary-button" type="submit">${appState.loading ? 'Searching...' : 'Search'}</button>
+            </div>
+          </form>
+          ${search.query ? `
+            <div class="stats">
+              ${groups.map(([key, label]) => `
+                <div class="stat">
+                  <div class="muted">${escapeHtml(label)}</div>
+                  <div class="stat__value">${escapeHtml(String(search.meta?.counts?.[key] || 0))}</div>
+                </div>
+              `).join('')}
+            </div>
+          ` : '<div class="empty-state">Start typing to search the workspace.</div>'}
+          ${search.query && !search.results?.length ? '<div class="empty-state">No results matched this search.</div>' : ''}
+          ${search.results?.length ? `
+            <div class="card">
+              <h3 class="card__title">Top results</h3>
+              <div class="stack">
+                ${search.results.map((result, index) => `
+                  <button class="notification-row notification-row--primary" type="button" data-action="open-search-result" data-value="${index}">
+                    <div class="notification-row__icon">
+                      <span class="material-symbols-outlined">${result.entityType === 'file' ? 'description' : result.entityType === 'chat' ? 'chat_bubble' : result.entityType === 'group' ? 'groups' : result.entityType === 'notification' ? 'notifications' : result.entityType === 'report' ? 'flag' : result.entityType === 'contact_request' ? 'person_add' : result.entityType === 'message' ? 'sms' : 'account_circle'}</span>
+                    </div>
+                    <div class="list__meta">
+                      <div class="list__title-row">
+                        <h3 class="list__title">${escapeHtml(result.title || 'Result')}</h3>
+                        <span class="list__time">${escapeHtml(result.entityType.replace('_', ' '))}</span>
+                      </div>
+                      <div class="list__preview">${escapeHtml(result.subtitle || '')}</div>
+                      ${result.preview ? `<div class="list__preview notification-row__preview">${escapeHtml(result.preview)}</div>` : ''}
+                    </div>
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+          ` : ''}
         </div>
       </div>
     </section>
@@ -2872,6 +2957,74 @@ function renderNotificationCard(notification) {
       </div>
       ${notification.isRead ? '' : '<span class="badge">New</span>'}
     </button>
+  `;
+}
+
+function renderCallsPanel() {
+  const selectedId = String(appState.route.params?.id || appState.callUi.current?.id || '');
+  const active = appState.callUi.history.find((item) => String(item.id || item._id) === selectedId) || appState.callUi.current;
+  const meId = String(appState.data.me?._id || appState.data.me?.id || '');
+  const participants = Array.isArray(active?.participants) ? active.participants : [];
+
+  return `
+    <section class="panel">
+      <div class="panel__header">
+        <div class="panel__header-main">
+          <div>
+            <h2 class="headline" style="font-size:1.25rem;margin:0;">Calls</h2>
+            <div class="muted">Realtime call state and signaling-ready session UI.</div>
+          </div>
+        </div>
+      </div>
+      <div class="panel__body">
+        <div class="page">
+          ${active ? `
+            <div class="card call-hero">
+              <div class="topbar">
+                <div>
+                  <h3 class="card__title" style="margin-bottom:0.35rem;">${escapeHtml(active.type === 'video' ? 'Video call' : 'Voice call')}</h3>
+                  <div class="muted">Status: ${escapeHtml(active.status || 'ringing')}</div>
+                </div>
+                <div class="topbar__actions">
+                  <button class="surface-button" type="button" data-action="leave-call" data-value="${escapeHtml(active.id)}">Leave</button>
+                  ${String(active.createdBy) === meId ? `<button class="danger-button" type="button" data-action="end-call" data-value="${escapeHtml(active.id)}">End call</button>` : ''}
+                </div>
+              </div>
+              <div class="details-list">
+                ${participants.map((participant) => `
+                  <div class="details-list__row">
+                    <div class="avatar">${participant.user?.profileImage ? `<img src="${escapeHtml(participant.user.profileImage)}" alt="${escapeHtml(participant.user.fullName || 'participant')}" />` : escapeHtml(initials(participant.user?.fullName || 'CL'))}</div>
+                    <div class="list__meta">
+                      <div class="list__title">${escapeHtml(participant.user?.fullName || 'Participant')}</div>
+                      <div class="list__preview">${escapeHtml(participant.state || 'ringing')}</div>
+                    </div>
+                    <span class="pill ${participant.state === 'connected' ? 'pill--primary' : ''}">${escapeHtml(participant.state || 'ringing')}</span>
+                  </div>
+                `).join('')}
+              </div>
+              <div class="muted">This pass connects the real backend call lifecycle and signaling. Peer media setup can be layered on top next.</div>
+            </div>
+          ` : '<div class="empty-state">No active call selected. Start a call from a conversation header.</div>'}
+          <div class="card">
+            <h3 class="card__title">Recent calls</h3>
+            <div class="stack">
+              ${appState.callUi.history.length ? appState.callUi.history.map((call) => `
+                <button class="notification-row notification-row--primary" type="button" data-action="open-call-panel" data-value="${escapeHtml(call.id || call._id || '')}">
+                  <div class="notification-row__icon"><span class="material-symbols-outlined">${call.type === 'video' ? 'videocam' : 'call'}</span></div>
+                  <div class="list__meta">
+                    <div class="list__title-row">
+                      <h3 class="list__title">${escapeHtml(call.type === 'video' ? 'Video call' : 'Voice call')}</h3>
+                      <span class="list__time">${escapeHtml(formatDate(call.createdAt))}</span>
+                    </div>
+                    <div class="list__preview">${escapeHtml(`${call.participants?.length || 0} participants · ${call.status}`)}</div>
+                  </div>
+                </button>
+              `).join('') : '<div class="muted">No calls yet.</div>'}
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
   `;
 }
 
@@ -3105,10 +3258,12 @@ function renderSelectField(label, name, selectedValue, values) {
 function renderMobileTabs() {
   const items = [
     ['messages', 'chat_bubble'],
+    ['search', 'search'],
     ['contacts', 'group'],
     ['requests', 'person_add'],
     ['groups', 'forum'],
     ['files', 'folder_open'],
+    ['calls', 'call'],
     ['notifications', 'notifications'],
     ['profile', 'account_circle'],
     ['privacy', 'shield'],
@@ -3127,6 +3282,86 @@ function renderMobileTabs() {
         </button>
       `).join('')}
     </nav>
+  `;
+}
+
+function renderMediaViewer() {
+  if (!appState.mediaViewer.open) {
+    return '';
+  }
+
+  const item = appState.mediaViewer.item || {};
+  const mediaUrl = item.mediaUrl || item.previewUrl || '';
+  const thumb = item.thumbnailUrl || item.previewUrl || mediaUrl;
+  const kind = item.mediaKind || item.type || 'file';
+
+  return `
+    <div class="details-overlay">
+      <button class="details-overlay__backdrop" type="button" data-action="close-media" aria-label="Close media viewer"></button>
+      <aside class="details-drawer media-viewer" role="dialog" aria-modal="true" aria-label="Media viewer">
+        <div class="details-drawer__header">
+          <div>
+            <h3 class="headline" style="font-size:1.2rem;margin:0;">Media viewer</h3>
+            <div class="muted">${escapeHtml(item.fileName || kind)}</div>
+          </div>
+          <button class="icon-button" type="button" data-action="close-media"><span class="material-symbols-outlined">close</span></button>
+        </div>
+        <div class="details-drawer__body">
+          ${appState.mediaViewer.loading ? '<div class="loading-state">Loading media…</div>' : ''}
+          ${appState.mediaViewer.error ? `<div class="error-state">${escapeHtml(appState.mediaViewer.error)}</div>` : ''}
+          ${!appState.mediaViewer.loading && !appState.mediaViewer.error ? `
+            <div class="media-viewer__stage">
+              ${kind === 'image' && mediaUrl ? `<img src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(item.fileName || 'image')}" />` : ''}
+              ${kind === 'video' && mediaUrl ? `<video controls src="${escapeHtml(mediaUrl)}" poster="${escapeHtml(thumb)}"></video>` : ''}
+              ${kind === 'audio' && mediaUrl ? `<audio controls src="${escapeHtml(mediaUrl)}"></audio>` : ''}
+              ${kind !== 'image' && kind !== 'video' && kind !== 'audio' ? `
+                <div class="media-viewer__fallback">
+                  <span class="material-symbols-outlined">description</span>
+                  <strong>${escapeHtml(item.fileName || 'File')}</strong>
+                  <p>${escapeHtml(item.mimeType || 'Shared file')}</p>
+                </div>
+              ` : ''}
+            </div>
+            <div class="card card--soft">
+              <div class="stack" style="gap:0.7rem;">
+                <div class="list__title">${escapeHtml(item.fileName || 'Media item')}</div>
+                <div class="file-card__meta">
+                  <span>${escapeHtml(item.mimeType || kind)}</span>
+                  ${item.fileSize ? `<span>${escapeHtml(formatFileSize(item.fileSize))}</span>` : ''}
+                  ${item.duration ? `<span>${escapeHtml(`${Math.round(item.duration)}s`)}</span>` : ''}
+                  ${item.pages ? `<span>${escapeHtml(`${item.pages} pages`)}</span>` : ''}
+                  ${item.width && item.height ? `<span>${escapeHtml(`${item.width}×${item.height}`)}</span>` : ''}
+                </div>
+                ${mediaUrl ? `<a class="primary-button" href="${escapeHtml(mediaUrl)}" target="_blank" rel="noreferrer">Open original</a>` : ''}
+              </div>
+            </div>
+          ` : ''}
+        </div>
+      </aside>
+    </div>
+  `;
+}
+
+function renderIncomingCallBanner() {
+  const call = appState.callUi.incoming;
+  if (!call) {
+    return '';
+  }
+
+  const caller = call.createdByUser?.fullName || 'Incoming call';
+  return `
+    <div class="call-banner">
+      <div class="call-banner__content">
+        <div>
+          <div class="list__title">${escapeHtml(caller)}</div>
+          <div class="list__preview">${escapeHtml(call.type === 'video' ? 'Video call' : 'Voice call')} · ${escapeHtml(call.status)}</div>
+        </div>
+        <div class="topbar__actions">
+          <button class="surface-button" type="button" data-action="reject-call" data-value="${escapeHtml(call.id)}">Decline</button>
+          <button class="primary-button" type="button" data-action="accept-call" data-value="${escapeHtml(call.id)}">Answer</button>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -3299,9 +3534,9 @@ function renderDetailsMediaGrid(media) {
               : 'description';
 
         return `
-          <a class="details-media-card" href="${escapeHtml(item.mediaUrl || src || '#')}" target="_blank" rel="noreferrer">
+          <button class="details-media-card" type="button" data-action="open-media" data-value="${escapeHtml(item._id || item.id || '')}">
             ${src ? `<img src="${escapeHtml(src)}" alt="${escapeHtml(item.fileName || 'media')}" />` : `<span class="material-symbols-outlined">${icon}</span>`}
-          </a>
+          </button>
         `;
       }).join('')}
     </div>
@@ -3311,6 +3546,7 @@ function renderDetailsMediaGrid(media) {
 function sectionLabel(section) {
   const labels = {
     messages: 'Messages',
+    search: 'Search',
     contacts: 'Contacts',
     requests: 'Requests',
     groups: 'Groups',
@@ -3319,6 +3555,7 @@ function sectionLabel(section) {
     profile: 'Profile',
     privacy: 'Privacy',
     security: 'Security',
+    calls: 'Calls',
     admin: 'Admin',
   };
   return labels[section] || 'Workspace';

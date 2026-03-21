@@ -4,6 +4,7 @@ const authService = require('../auth/auth.service');
 const ApiError = require('../../utils/ApiError');
 const auditLog = require('../../utils/audit');
 const env = require('../../config/env');
+const mailer = require('../../utils/mailer');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const { generateOpaqueToken, hashOpaqueToken } = require('../../utils/token');
 
@@ -259,6 +260,11 @@ async function listInvites(userId, query) {
 
 async function createInvite(userId, payload) {
   const emailNormalized = normalizeEmail(payload.email);
+  const inviter = await User.findById(userId).select('fullName username');
+  if (!inviter) {
+    throw new ApiError(404, 'Inviter not found');
+  }
+
   const existingPending = await Invite.findOne({
     invitedByUserId: userId,
     emailNormalized,
@@ -284,9 +290,18 @@ async function createInvite(userId, payload) {
     emailNormalized,
   });
 
+  const inviteUrl = buildInviteUrl(token);
+  const emailDelivery = await mailer.sendInviteEmail({
+    to: emailNormalized,
+    inviteUrl,
+    inviterName: inviter.fullName || inviter.username,
+    actorId: userId,
+  });
+
   return {
     invite,
-    inviteUrl: buildInviteUrl(token),
+    inviteUrl,
+    emailDelivery,
     ...(process.env.NODE_ENV !== 'production' ? { devOnly: { token } } : {}),
   };
 }
@@ -317,9 +332,19 @@ async function resendInvite(userId, inviteId) {
 
   auditLog('invite.resent', userId, { inviteId });
 
+  const inviter = await User.findById(userId).select('fullName username');
+  const inviteUrl = buildInviteUrl(token);
+  const emailDelivery = await mailer.sendInviteEmail({
+    to: invite.emailNormalized,
+    inviteUrl,
+    inviterName: inviter?.fullName || inviter?.username || 'A teammate',
+    actorId: userId,
+  });
+
   return {
     invite,
-    inviteUrl: buildInviteUrl(token),
+    inviteUrl,
+    emailDelivery,
     ...(process.env.NODE_ENV !== 'production' ? { devOnly: { token } } : {}),
   };
 }

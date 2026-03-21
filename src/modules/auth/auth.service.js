@@ -4,6 +4,7 @@ const AuthSession = require('./authSession.model');
 const ApiError = require('../../utils/ApiError');
 const auditLog = require('../../utils/audit');
 const env = require('../../config/env');
+const mailer = require('../../utils/mailer');
 const { hashPassword, comparePassword, evaluatePassword } = require('../../utils/password');
 const {
   signAccessToken,
@@ -324,8 +325,15 @@ async function register(payload, context = {}, options = {}) {
   await PrivacySettings.create({ userId: user._id });
 
   let verificationToken = null;
+  let emailDelivery = null;
   if (shouldRequireVerification) {
     verificationToken = await prepareVerification(user);
+    emailDelivery = await mailer.sendVerificationEmail({
+      to: user.email,
+      fullName: user.fullName,
+      token: verificationToken,
+      actorId: user._id,
+    });
   }
 
   auditLog('auth.registration_created', user._id, {
@@ -339,6 +347,7 @@ async function register(payload, context = {}, options = {}) {
       requiresEmailVerification: true,
       verificationPending: true,
       email: user.email,
+      emailDelivery,
       ...(process.env.NODE_ENV !== 'production' && verificationToken
         ? { devOnly: { verificationToken } }
         : {}),
@@ -464,6 +473,12 @@ async function forgotPassword(payload, context = {}) {
   user.passwordResetTokenExpiresAt = getResetExpiryDate();
   user.passwordResetRequestedAt = new Date();
   await user.save();
+  const emailDelivery = await mailer.sendPasswordResetEmail({
+    to: user.email,
+    fullName: user.fullName,
+    token,
+    actorId: user._id,
+  });
 
   auditLog('auth.password_reset_requested', user._id, {
     ipAddress: context.ipAddress,
@@ -472,6 +487,7 @@ async function forgotPassword(payload, context = {}) {
 
   return {
     message: GENERIC_FORGOT_RESPONSE,
+    emailDelivery,
     ...(process.env.NODE_ENV !== 'production' ? { devOnly: { resetToken: token } } : {}),
   };
 }
@@ -555,6 +571,12 @@ async function resendVerification(userId, payload = {}, context = {}) {
   }
 
   const verificationToken = await prepareVerification(user);
+  const emailDelivery = await mailer.sendVerificationEmail({
+    to: user.email,
+    fullName: user.fullName,
+    token: verificationToken,
+    actorId: user._id,
+  });
 
   auditLog('auth.verification_resent', user._id, {
     ipAddress: context.ipAddress,
@@ -563,6 +585,7 @@ async function resendVerification(userId, payload = {}, context = {}) {
 
   return {
     message: GENERIC_VERIFICATION_RESPONSE,
+    emailDelivery,
     ...(process.env.NODE_ENV !== 'production' ? { devOnly: { verificationToken } } : {}),
   };
 }

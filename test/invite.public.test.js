@@ -5,6 +5,7 @@ const Invite = require('../src/modules/invites/invite.model');
 const User = require('../src/modules/users/user.model');
 const authService = require('../src/modules/auth/auth.service');
 const inviteService = require('../src/modules/invites/invite.service');
+const mailer = require('../src/utils/mailer');
 
 function createInviteDoc(overrides = {}) {
   return {
@@ -40,6 +41,7 @@ test.beforeEach(() => {
     userFindById: User.findById,
     authRegister: authService.register,
     authLogin: authService.login,
+    sendInviteEmail: mailer.sendInviteEmail,
   };
 });
 
@@ -50,6 +52,7 @@ test.afterEach(() => {
   User.findById = originals.userFindById;
   authService.register = originals.authRegister;
   authService.login = originals.authLogin;
+  mailer.sendInviteEmail = originals.sendInviteEmail;
 });
 
 test('public invite landing returns invalid state for unknown token', async () => {
@@ -66,6 +69,13 @@ test('invite creation allows inviting an email that already belongs to an accoun
   User.findOne = () => ({
     lean: async () => ({ _id: '507f1f77bcf86cd799439055', email: 'invitee@example.com' }),
   });
+  User.findById = () => ({
+    select: async () => ({
+      _id: '507f1f77bcf86cd799439010',
+      fullName: 'Workspace Owner',
+      username: 'owner',
+    }),
+  });
 
   Invite.findOne = () => ({
     lean: async () => null,
@@ -75,6 +85,11 @@ test('invite creation allows inviting an email that already belongs to an accoun
     _id: '507f1f77bcf86cd799439066',
     ...payload,
   });
+  let sentInvitePayload = null;
+  mailer.sendInviteEmail = async (payload) => {
+    sentInvitePayload = payload;
+    return { status: 'sent', configured: true };
+  };
 
   const result = await inviteService.createInvite('507f1f77bcf86cd799439010', {
     email: 'invitee@example.com',
@@ -82,6 +97,9 @@ test('invite creation allows inviting an email that already belongs to an accoun
 
   assert.equal(result.invite.emailNormalized, 'invitee@example.com');
   assert.match(result.inviteUrl, /\/invites\//);
+  assert.equal(result.emailDelivery.status, 'sent');
+  assert.equal(sentInvitePayload.to, 'invitee@example.com');
+  assert.match(sentInvitePayload.inviteUrl, /\/invites\//);
 });
 
 test('public invite landing returns sign-in recommendation when account already exists', async () => {
