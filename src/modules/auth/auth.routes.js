@@ -27,6 +27,10 @@ router.post('/register', registrationRateLimit, validation.registerValidation, v
 router.post('/login', loginRateLimit, validation.loginValidation, validateRequest, controller.login);
 router.post('/logout', controller.logout);
 router.post('/logout-all', authenticate, controller.logoutAll);
+router.get('/sessions', authenticate, controller.listSessions);
+router.delete('/sessions/:sessionId', authenticate, validation.revokeSessionValidation, validateRequest, controller.revokeSession);
+router.post('/deactivate-account', authenticate, validation.deactivateAccountValidation, validateRequest, controller.deactivateAccount);
+router.post('/delete-account', authenticate, validation.deleteAccountValidation, validateRequest, controller.deleteAccount);
 router.post('/refresh', validation.refreshTokenValidation, validateRequest, controller.refreshToken);
 router.post('/refresh-token', validation.refreshTokenValidation, validateRequest, controller.refreshToken);
 router.get('/me', authenticate, controller.me);

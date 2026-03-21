@@ -1,4 +1,4 @@
-const { body } = require('express-validator');
+const { body, param } = require('express-validator');
 const env = require('../../config/env');
 const { evaluatePassword } = require('../../utils/password');
 
@@ -103,6 +103,18 @@ const refreshTokenValidation = [
   body('refreshToken').optional().isString().notEmpty().withMessage('refreshToken must be a non-empty string.'),
 ];
 
+const revokeSessionValidation = [
+  param('sessionId').isMongoId().withMessage('sessionId must be a valid session id.'),
+];
+
+const deactivateAccountValidation = [
+  body('currentPassword').isString().notEmpty().withMessage('Current password is required.'),
+];
+
+const deleteAccountValidation = [
+  body('currentPassword').isString().notEmpty().withMessage('Current password is required.'),
+];
+
 module.exports = {
   registerValidation,
   loginValidation,
@@ -112,6 +124,9 @@ module.exports = {
   verifyEmailValidation,
   resendVerificationValidation,
   refreshTokenValidation,
+  revokeSessionValidation,
+  deactivateAccountValidation,
+  deleteAccountValidation,
   passwordHints: {
     minLength: env.auth.passwordMinLength,
   },

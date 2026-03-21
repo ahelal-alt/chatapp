@@ -67,6 +67,26 @@ const joinByInviteCode = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Joined group successfully', group));
 });
 
+const submitJoinRequest = asyncHandler(async (req, res) => {
+  const joinRequest = await service.submitJoinRequest(req.params.groupId, req.user._id, req.body);
+  res.status(201).json(new ApiResponse('Join request created successfully', joinRequest));
+});
+
+const listJoinRequests = asyncHandler(async (req, res) => {
+  const result = await service.listJoinRequests(req.params.groupId, req.user._id, req.query);
+  res.json(new ApiResponse('Join requests fetched successfully', result.items, result.meta));
+});
+
+const approveJoinRequest = asyncHandler(async (req, res) => {
+  const joinRequest = await service.reviewJoinRequest(req.params.groupId, req.params.requestId, req.user._id, 'approved');
+  res.json(new ApiResponse('Join request approved successfully', joinRequest));
+});
+
+const rejectJoinRequest = asyncHandler(async (req, res) => {
+  const joinRequest = await service.reviewJoinRequest(req.params.groupId, req.params.requestId, req.user._id, 'rejected');
+  res.json(new ApiResponse('Join request rejected successfully', joinRequest));
+});
+
 module.exports = {
   listGroups,
   createGroup,
@@ -81,4 +101,8 @@ module.exports = {
   leaveGroup,
   generateInviteCode,
   joinByInviteCode,
+  submitJoinRequest,
+  listJoinRequests,
+  approveJoinRequest,
+  rejectJoinRequest,
 };

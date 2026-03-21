@@ -9,6 +9,7 @@ const router = express.Router();
 router.use(authenticate);
 
 router.get('/', validation.listValidation, validateRequest, controller.listContacts);
+router.get('/recent', validation.listValidation, validateRequest, controller.listRecentContacts);
 router.delete(
   '/:contactUserId',
   validation.contactUserValidation,
@@ -27,6 +28,17 @@ router.delete(
   validateRequest,
   controller.unfavoriteContact,
 );
+router.post(
+  '/:contactUserId/mute',
+  validation.muteContactValidation,
+  validateRequest,
+  controller.muteContact,
+);
+router.delete(
+  '/:contactUserId/mute',
+  validation.contactUserValidation,
+  validateRequest,
+  controller.unmuteContact,
+);
 
 module.exports = router;
-

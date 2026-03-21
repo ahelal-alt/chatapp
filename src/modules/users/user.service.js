@@ -204,6 +204,7 @@ async function getUserEncryptionKey(viewerId, userId) {
 module.exports = {
   getUserPrivacy,
   areContacts,
+  buildPublicProfile,
   getMyProfile,
   updateMyProfile,
   updateProfileImage,

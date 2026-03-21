@@ -23,6 +23,9 @@ const notificationRoutes = require('./modules/notifications/notification.routes'
 const uploadRoutes = require('./modules/uploads/upload.routes');
 const reportRoutes = require('./modules/reports/report.routes');
 const adminRoutes = require('./modules/admin/admin.routes');
+const searchRoutes = require('./modules/search/search.routes');
+const inviteRoutes = require('./modules/invites/invite.routes');
+const callRoutes = require('./modules/calls/call.routes');
 
 const app = express();
 
@@ -60,6 +63,9 @@ app.use('/api/v1/notifications', notificationRoutes);
 app.use('/api/v1/uploads', uploadRoutes);
 app.use('/api/v1/reports', reportRoutes);
 app.use('/api/v1/admin', adminRoutes);
+app.use('/api/v1/search', searchRoutes);
+app.use('/api/v1/invites', inviteRoutes);
+app.use('/api/v1/calls', callRoutes);
 
 setupSwagger(app);
 

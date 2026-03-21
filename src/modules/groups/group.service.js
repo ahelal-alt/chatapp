@@ -1,6 +1,7 @@
 const { v4: uuid } = require('uuid');
 const Group = require('./group.model');
 const GroupMember = require('./groupMember.model');
+const GroupJoinRequest = require('./groupJoinRequest.model');
 const Chat = require('../chats/chat.model');
 const Message = require('../messages/message.model');
 const notificationService = require('../notifications/notification.service');
@@ -418,6 +419,122 @@ async function joinByInviteCode(inviteCode, userId) {
   return group;
 }
 
+async function submitJoinRequest(groupId, userId, payload = {}) {
+  const group = await Group.findById(groupId);
+
+  if (!group) {
+    throw new ApiError(404, 'Group not found');
+  }
+
+  await ensureActiveUser(userId, 'User not found');
+
+  const existingMember = await GroupMember.findOne({ groupId, userId }).lean();
+  if (existingMember) {
+    throw new ApiError(400, 'You are already a member of this group');
+  }
+
+  const existingPending = await GroupJoinRequest.findOne({
+    groupId,
+    requesterUserId: userId,
+    status: 'pending',
+  }).lean();
+  if (existingPending) {
+    throw new ApiError(409, 'A join request is already pending');
+  }
+
+  const request = await GroupJoinRequest.create({
+    groupId,
+    requesterUserId: userId,
+    message: payload.message || '',
+  });
+
+  const admins = await GroupMember.find({
+    groupId,
+    role: { $in: ['owner', 'admin'] },
+  }).lean();
+
+  for (const admin of admins) {
+    if (String(admin.userId) === String(userId)) {
+      continue;
+    }
+
+    await notificationService.createNotification({
+      userId: admin.userId,
+      type: 'group_join_request',
+      title: 'Join request received',
+      body: 'A user requested to join your group',
+      data: { groupId, joinRequestId: request._id, chatId: group.chatId },
+    });
+  }
+
+  return request;
+}
+
+async function listJoinRequests(groupId, userId, query) {
+  const { group, membership } = await ensureGroupMember(groupId, userId);
+
+  if (!canManageMembers(group, membership) && !['owner', 'admin'].includes(membership.role)) {
+    throw new ApiError(403, 'You are not allowed to review join requests');
+  }
+
+  const { page, limit, skip } = getPagination(query);
+  const criteria = {
+    groupId,
+    status: query.status || 'pending',
+  };
+
+  const [items, total] = await Promise.all([
+    GroupJoinRequest.find(criteria)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('requesterUserId', 'fullName username profileImage')
+      .populate('reviewedByUserId', 'fullName username'),
+    GroupJoinRequest.countDocuments(criteria),
+  ]);
+
+  return {
+    items,
+    meta: buildPaginationMeta({ page, limit, total }),
+  };
+}
+
+async function reviewJoinRequest(groupId, requestId, actorId, status) {
+  const { group, membership } = await ensureGroupMember(groupId, actorId);
+
+  if (!canManageMembers(group, membership) && !['owner', 'admin'].includes(membership.role)) {
+    throw new ApiError(403, 'You are not allowed to review join requests');
+  }
+
+  const request = await GroupJoinRequest.findOne({
+    _id: requestId,
+    groupId,
+    status: 'pending',
+  });
+  if (!request) {
+    throw new ApiError(404, 'Join request not found');
+  }
+
+  if (status === 'approved') {
+    await addMembers(groupId, actorId, [String(request.requesterUserId)]);
+  } else {
+    await notificationService.createNotification({
+      userId: request.requesterUserId,
+      type: 'group_join_request_rejected',
+      title: 'Join request declined',
+      body: `Your request to join ${group.name} was declined`,
+      data: { groupId, chatId: group.chatId, joinRequestId: request._id },
+    });
+  }
+
+  request.status = status;
+  request.reviewedByUserId = actorId;
+  request.reviewedAt = new Date();
+  await request.save();
+
+  return request;
+}
+
 async function deleteGroup(groupId, userId) {
   const { group, membership } = await ensureGroupMember(groupId, userId);
 
@@ -427,6 +544,7 @@ async function deleteGroup(groupId, userId) {
 
   await Promise.all([
     GroupMember.deleteMany({ groupId }),
+    GroupJoinRequest.deleteMany({ groupId }),
     Message.deleteMany({ chatId: group.chatId }),
     Chat.findByIdAndDelete(group.chatId),
     Group.findByIdAndDelete(groupId),
@@ -446,5 +564,8 @@ module.exports = {
   leaveGroup,
   regenerateInviteCode,
   joinByInviteCode,
+  submitJoinRequest,
+  listJoinRequests,
+  reviewJoinRequest,
   deleteGroup,
 };

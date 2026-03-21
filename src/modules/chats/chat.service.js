@@ -152,20 +152,57 @@ async function getUnreadCount(chatId, userId, clearedAt) {
 async function listChats(userId, query) {
   const { page, limit, skip } = getPagination(query);
   const criteria = { memberIds: userId };
+  const requiresPostFilter = query.archived !== undefined
+    || query.muted !== undefined
+    || query.pinned !== undefined
+    || Boolean(query.q);
+  if (query.type) {
+    criteria.type = query.type;
+  }
+
+  const baseQuery = Chat.find(criteria)
+    .sort({ lastMessageAt: -1, updatedAt: -1 })
+    .populate('lastMessageId')
+    .populate('memberIds', 'fullName username profileImage isOnline lastSeen encryptionPublicKey encryptionKeyVersion encryptionEnabled');
+
+  if (!requiresPostFilter) {
+    baseQuery.skip(skip).limit(limit);
+  }
 
   const [items, total] = await Promise.all([
-    Chat.find(criteria)
-      .sort({ lastMessageAt: -1, updatedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('lastMessageId')
-      .populate('memberIds', 'fullName username profileImage isOnline lastSeen encryptionPublicKey encryptionKeyVersion encryptionEnabled'),
+    baseQuery,
     Chat.countDocuments(criteria),
   ]);
 
   const enriched = [];
   for (const chat of items) {
     const setting = ensureParticipantSetting(chat, userId);
+    const isArchived = Boolean(setting.archivedAt);
+    const isMuted = Boolean(setting.mutedUntil && new Date(setting.mutedUntil) > new Date());
+    const isPinned = Boolean(setting.pinnedAt);
+
+    if (query.archived !== undefined && String(query.archived) === 'true' && !isArchived) {
+      continue;
+    }
+    if (query.archived !== undefined && String(query.archived) === 'false' && isArchived) {
+      continue;
+    }
+    if (query.muted !== undefined && String(query.muted) === 'true' && !isMuted) {
+      continue;
+    }
+    if (query.muted !== undefined && String(query.muted) === 'false' && isMuted) {
+      continue;
+    }
+    if (query.pinned !== undefined && String(query.pinned) === 'true' && !isPinned) {
+      continue;
+    }
+    if (query.pinned !== undefined && String(query.pinned) === 'false' && isPinned) {
+      continue;
+    }
+    if (query.q && !(chat.lastMessagePreview || '').toLowerCase().includes(String(query.q).trim().toLowerCase())) {
+      continue;
+    }
+
     const unreadCount = await getUnreadCount(chat._id, userId, setting.clearedAt);
     enriched.push({
       ...chat.toObject(),
@@ -174,9 +211,11 @@ async function listChats(userId, query) {
     });
   }
 
+  const paginatedItems = requiresPostFilter ? enriched.slice(skip, skip + limit) : enriched;
+
   return {
-    items: enriched,
-    meta: buildPaginationMeta({ page, limit, total }),
+    items: paginatedItems,
+    meta: buildPaginationMeta({ page, limit, total: requiresPostFilter ? enriched.length : total }),
   };
 }
 

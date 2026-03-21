@@ -42,6 +42,16 @@ async function listNotifications(userId, query) {
   };
 }
 
+async function getNotificationDetails(userId, notificationId) {
+  const notification = await Notification.findOne({ _id: notificationId, userId });
+
+  if (!notification) {
+    throw new ApiError(404, 'Notification not found');
+  }
+
+  return notification;
+}
+
 async function markRead(userId, notificationId) {
   const notification = await Notification.findOneAndUpdate(
     { _id: notificationId, userId },
@@ -81,6 +91,7 @@ async function getUnreadCount(userId) {
 module.exports = {
   createNotification,
   listNotifications,
+  getNotificationDetails,
   markRead,
   markAllRead,
   getUnreadCount,

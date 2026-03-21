@@ -13,6 +13,10 @@ router.post('/', validation.createGroupValidation, validateRequest, controller.c
 router.get('/:groupId', validation.groupIdValidation, validateRequest, controller.getGroup);
 router.put('/:groupId', validation.updateGroupValidation, validateRequest, controller.updateGroup);
 router.delete('/:groupId', validation.groupIdValidation, validateRequest, controller.deleteGroup);
+router.post('/:groupId/join-requests', validation.submitJoinRequestValidation, validateRequest, controller.submitJoinRequest);
+router.get('/:groupId/join-requests', validation.listJoinRequestsValidation, validateRequest, controller.listJoinRequests);
+router.put('/:groupId/join-requests/:requestId/approve', validation.reviewJoinRequestValidation, validateRequest, controller.approveJoinRequest);
+router.put('/:groupId/join-requests/:requestId/reject', validation.reviewJoinRequestValidation, validateRequest, controller.rejectJoinRequest);
 router.post('/:groupId/members', validation.addMembersValidation, validateRequest, controller.addMembers);
 router.delete('/:groupId/members/:userId', validation.memberActionValidation, validateRequest, controller.removeMember);
 router.put('/:groupId/members/:userId/promote', validation.memberActionValidation, validateRequest, controller.promoteMember);

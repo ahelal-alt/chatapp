@@ -407,6 +407,20 @@ async function getMessageById(userId, messageId) {
   return message;
 }
 
+async function getMediaDetails(userId, messageId) {
+  const message = await getMessageById(userId, messageId);
+
+  if (!message.mediaUrl) {
+    throw new ApiError(404, 'Media asset not found');
+  }
+
+  return {
+    ...message.toObject(),
+    mediaKind: buildMediaKind(message),
+    previewable: ['image', 'video', 'audio'].includes(buildMediaKind(message)),
+  };
+}
+
 async function editMessage(userId, messageId, text) {
   const message = await Message.findById(messageId);
 
@@ -653,6 +667,7 @@ module.exports = {
   listPinnedMessages,
   listSharedFiles,
   getMessageById,
+  getMediaDetails,
   editMessage,
   pinMessage,
   unpinMessage,

@@ -9,6 +9,7 @@ const router = express.Router();
 router.use(authenticate);
 
 router.get('/', validation.listValidation, validateRequest, controller.listNotifications);
+router.get('/:notificationId', validation.notificationIdValidation, validateRequest, controller.getNotificationDetails);
 router.put(
   '/:notificationId/read',
   validation.notificationIdValidation,

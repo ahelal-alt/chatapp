@@ -7,6 +7,11 @@ const listNotifications = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Notifications fetched successfully', result.items, result.meta));
 });
 
+const getNotificationDetails = asyncHandler(async (req, res) => {
+  const notification = await service.getNotificationDetails(req.user._id, req.params.notificationId);
+  res.json(new ApiResponse('Notification fetched successfully', notification));
+});
+
 const markRead = asyncHandler(async (req, res) => {
   const notification = await service.markRead(req.user._id, req.params.notificationId);
   res.json(new ApiResponse('Notification marked as read', notification));
@@ -19,7 +24,7 @@ const markAllRead = asyncHandler(async (req, res) => {
 
 module.exports = {
   listNotifications,
+  getNotificationDetails,
   markRead,
   markAllRead,
 };
-

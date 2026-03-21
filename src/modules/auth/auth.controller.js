@@ -80,11 +80,39 @@ const logoutAll = asyncHandler(async (req, res) => {
   res.json(new ApiResponse(data.message));
 });
 
+const listSessions = asyncHandler(async (req, res) => {
+  setNoStore(res);
+  const sessions = await authService.listSessions(req.user._id);
+  res.json(new ApiResponse('Sessions fetched successfully', sessions));
+});
+
+const revokeSession = asyncHandler(async (req, res) => {
+  setNoStore(res);
+  const data = await authService.revokeSession(req.user._id, req.params.sessionId, getRequestMeta(req));
+  res.json(new ApiResponse(data.message));
+});
+
+const deactivateAccount = asyncHandler(async (req, res) => {
+  setNoStore(res);
+  const data = await authService.deactivateAccount(req.user._id, req.body, getRequestMeta(req));
+  res.json(new ApiResponse(data.message));
+});
+
+const deleteAccount = asyncHandler(async (req, res) => {
+  setNoStore(res);
+  const data = await authService.deleteAccount(req.user._id, req.body, getRequestMeta(req));
+  res.json(new ApiResponse(data.message));
+});
+
 module.exports = {
   register,
   login,
   logout,
   logoutAll,
+  listSessions,
+  revokeSession,
+  deactivateAccount,
+  deleteAccount,
   refreshToken,
   me,
   changePassword,

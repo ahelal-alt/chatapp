@@ -1,5 +1,6 @@
 const Contact = require('./contact.model');
 const ContactRequest = require('./contactRequest.model');
+const Chat = require('../chats/chat.model');
 const ApiError = require('../../utils/ApiError');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const { assertNotBlocked } = require('../../utils/blockCheck');
@@ -207,6 +208,70 @@ async function favoriteContact(userId, contactUserId, isFavorite) {
   return contact;
 }
 
+async function muteContact(userId, contactUserId, mutedUntil) {
+  const contact = await Contact.findOneAndUpdate(
+    { userId, contactUserId },
+    { mutedUntil: mutedUntil || new Date(Date.now() + 24 * 60 * 60 * 1000) },
+    { new: true },
+  );
+
+  if (!contact) {
+    throw new ApiError(404, 'Contact not found');
+  }
+
+  return contact;
+}
+
+async function unmuteContact(userId, contactUserId) {
+  const contact = await Contact.findOneAndUpdate(
+    { userId, contactUserId },
+    { mutedUntil: null },
+    { new: true },
+  );
+
+  if (!contact) {
+    throw new ApiError(404, 'Contact not found');
+  }
+
+  return contact;
+}
+
+async function listRecentContacts(userId, query) {
+  const { page, limit, skip } = getPagination(query);
+  const contacts = await Contact.find({ userId }).populate('contactUserId', 'fullName username profileImage statusMessage isOnline lastSeen');
+  const contactIds = contacts.map((contact) => contact.contactUserId?._id).filter(Boolean);
+  const privateChats = await Chat.find({
+    type: 'private',
+    memberIds: userId,
+  })
+    .select('memberIds lastMessageAt')
+    .sort({ lastMessageAt: -1 })
+    .lean();
+
+  const recentByUserId = new Map();
+  for (const chat of privateChats) {
+    const otherId = chat.memberIds.find((memberId) => (
+      String(memberId) !== String(userId)
+      && contactIds.some((contactId) => String(contactId) === String(memberId))
+    ));
+    if (otherId && !recentByUserId.has(String(otherId))) {
+      recentByUserId.set(String(otherId), chat.lastMessageAt || null);
+    }
+  }
+
+  const sorted = contacts
+    .map((contact) => ({
+      ...contact.toObject(),
+      lastInteractedAt: recentByUserId.get(String(contact.contactUserId?._id)) || contact.lastInteractedAt || contact.createdAt,
+    }))
+    .sort((a, b) => new Date(b.lastInteractedAt || 0) - new Date(a.lastInteractedAt || 0));
+
+  return {
+    items: sorted.slice(skip, skip + limit),
+    meta: buildPaginationMeta({ page, limit, total: sorted.length }),
+  };
+}
+
 module.exports = {
   sendRequest,
   acceptRequest,
@@ -217,4 +282,7 @@ module.exports = {
   listContacts,
   removeContact,
   favoriteContact,
+  muteContact,
+  unmuteContact,
+  listRecentContacts,
 };

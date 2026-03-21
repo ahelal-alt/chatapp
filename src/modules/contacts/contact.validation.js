@@ -17,10 +17,15 @@ const listValidation = [
   query('limit').optional().isInt({ min: 1, max: 100 }),
 ];
 
+const muteContactValidation = [
+  ...contactUserValidation,
+  body('mutedUntil').optional().isISO8601().withMessage('mutedUntil must be a valid date'),
+];
+
 module.exports = {
   sendRequestValidation,
   requestActionValidation,
   contactUserValidation,
   listValidation,
+  muteContactValidation,
 };
-

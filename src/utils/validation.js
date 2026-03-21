@@ -37,14 +37,30 @@ function normalizeUploadPath(value) {
 
 function buildUploadedAsset(file) {
   const relativePath = normalizeUploadPath(`${env.uploadDir}/${file.filename}`);
+  const mimeType = file.mimetype || '';
+  const mediaKind = mimeType.startsWith('image/')
+    ? 'image'
+    : mimeType.startsWith('video/')
+      ? 'video'
+      : mimeType.startsWith('audio/')
+        ? 'audio'
+        : (mimeType === 'application/pdf'
+          || mimeType.includes('document')
+          || mimeType.includes('sheet')
+          || mimeType.includes('presentation')
+          || mimeType.startsWith('text/'))
+          ? 'document'
+          : 'other';
 
   return {
     url: relativePath,
     path: relativePath,
     previewUrl: relativePath,
-    mimeType: file.mimetype,
+    mimeType,
     fileName: file.originalname,
     fileSize: file.size,
+    mediaKind,
+    previewable: ['image', 'video', 'audio'].includes(mediaKind),
   };
 }
 

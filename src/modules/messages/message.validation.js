@@ -35,6 +35,17 @@ const chatMessageListValidation = [
   query('limit').optional().isInt({ min: 1, max: 100 }),
 ];
 
+const chatSharedFilesValidation = [
+  param('chatId').isMongoId().withMessage('Invalid chat id'),
+  query('kind').optional().isIn(['all', 'image', 'video', 'audio', 'document', 'other']),
+  query('senderId').optional().isMongoId().withMessage('Invalid sender id'),
+  query('q').optional().trim().isLength({ min: 1, max: 80 }),
+  query('from').optional().isISO8601().withMessage('from must be a valid date'),
+  query('to').optional().isISO8601().withMessage('to must be a valid date'),
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 100 }),
+];
+
 const sharedFilesValidation = [
   query('kind').optional().isIn(['all', 'image', 'video', 'audio', 'document', 'other']),
   query('chatId').optional().isMongoId().withMessage('Invalid chat id'),
@@ -48,6 +59,10 @@ const sharedFilesValidation = [
 
 const messageIdValidation = [
   param('messageId').isMongoId().withMessage('Invalid message id'),
+];
+
+const mediaDetailsValidation = [
+  ...messageIdValidation,
 ];
 
 const messageSearchValidation = [
@@ -73,8 +88,10 @@ const reactionValidation = [
 module.exports = {
   sendMessageValidation,
   chatMessageListValidation,
+  chatSharedFilesValidation,
   sharedFilesValidation,
   messageIdValidation,
+  mediaDetailsValidation,
   messageSearchValidation,
   editMessageValidation,
   reactionValidation,

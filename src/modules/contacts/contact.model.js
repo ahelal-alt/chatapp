@@ -18,6 +18,15 @@ const contactSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    mutedUntil: {
+      type: Date,
+      default: null,
+    },
+    lastInteractedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
   },
   {
     timestamps: {
@@ -30,4 +39,3 @@ const contactSchema = new mongoose.Schema(
 contactSchema.index({ userId: 1, contactUserId: 1 }, { unique: true });
 
 module.exports = mongoose.model('Contact', contactSchema);
-

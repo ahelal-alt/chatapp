@@ -613,6 +613,116 @@ async function logoutAll(userId, context = {}) {
   return { message: 'Logged out from all devices successfully' };
 }
 
+async function listSessions(userId) {
+  const sessions = await AuthSession.find({
+    userId,
+    revokedAt: null,
+    expiresAt: { $gt: new Date() },
+  })
+    .sort({ lastUsedAt: -1, createdAt: -1 })
+    .select('rememberMe expiresAt createdAt lastUsedAt lastUsedIp userAgent tokenId');
+
+  return sessions.map((session) => ({
+    id: session._id,
+    rememberMe: Boolean(session.rememberMe),
+    createdAt: session.createdAt,
+    lastUsedAt: session.lastUsedAt,
+    expiresAt: session.expiresAt,
+    ipAddress: session.lastUsedIp || '',
+    userAgent: session.userAgent || '',
+  }));
+}
+
+async function revokeSession(userId, sessionId, context = {}) {
+  const session = await AuthSession.findOne({
+    _id: sessionId,
+    userId,
+    revokedAt: null,
+  });
+
+  if (!session) {
+    throw new ApiError(404, 'Session not found');
+  }
+
+  session.revokedAt = new Date();
+  session.revokeReason = 'manual_revoke';
+  await session.save();
+
+  auditLog('auth.session_revoked', userId, {
+    sessionId,
+    ipAddress: context.ipAddress,
+    userAgent: context.userAgent,
+  });
+
+  return { message: 'Session revoked successfully' };
+}
+
+async function deactivateAccount(userId, payload, context = {}) {
+  const user = await User.findById(userId).select('+passwordHash +sessionVersion');
+  if (!user) {
+    throw new ApiError(404, 'User not found');
+  }
+
+  const matches = await comparePassword(payload.currentPassword, user.passwordHash);
+  if (!matches) {
+    throw new ApiError(400, 'Current password is incorrect');
+  }
+
+  user.accountStatus = 'disabled';
+  user.isActive = false;
+  user.lockUntil = null;
+  user.sessionVersion = Number(user.sessionVersion || 0) + 1;
+  await user.save();
+  await revokeAllSessionsForUser(userId, 'account_deactivated');
+
+  auditLog('auth.account_deactivated', userId, {
+    ipAddress: context.ipAddress,
+    userAgent: context.userAgent,
+  });
+
+  return { message: 'Account deactivated successfully' };
+}
+
+async function deleteAccount(userId, payload, context = {}) {
+  const user = await User.findById(userId).select('+passwordHash +sessionVersion');
+  if (!user) {
+    throw new ApiError(404, 'User not found');
+  }
+
+  const matches = await comparePassword(payload.currentPassword, user.passwordHash);
+  if (!matches) {
+    throw new ApiError(400, 'Current password is incorrect');
+  }
+
+  user.accountStatus = 'deleted';
+  user.isActive = false;
+  user.email = `deleted-${user._id}@deleted.local`;
+  user.emailNormalized = user.email;
+  user.username = `deleted-${String(user._id).slice(-8)}`;
+  user.fullName = 'Deleted User';
+  user.profileImage = '';
+  user.bio = '';
+  user.location = '';
+  user.statusMessage = '';
+  user.encryptionPublicKey = '';
+  user.encryptionEnabled = false;
+  user.verificationTokenHash = null;
+  user.verificationTokenExpiresAt = null;
+  user.passwordResetTokenHash = null;
+  user.passwordResetTokenExpiresAt = null;
+  user.passwordResetRequestedAt = null;
+  user.sessionVersion = Number(user.sessionVersion || 0) + 1;
+  await user.save();
+  await revokeAllSessionsForUser(userId, 'account_deleted');
+
+  auditLog('auth.account_deleted', userId, {
+    ipAddress: context.ipAddress,
+    userAgent: context.userAgent,
+  });
+
+  return { message: 'Account deleted successfully' };
+}
+
 module.exports = {
   register,
   login,
@@ -625,4 +735,8 @@ module.exports = {
   refreshToken,
   logout,
   logoutAll,
+  listSessions,
+  revokeSession,
+  deactivateAccount,
+  deleteAccount,
 };

@@ -11,6 +11,11 @@ const chatIdValidation = [
 const listChatValidation = [
   query('page').optional().isInt({ min: 1 }),
   query('limit').optional().isInt({ min: 1, max: 100 }),
+  query('archived').optional().isBoolean().withMessage('archived must be true or false'),
+  query('muted').optional().isBoolean().withMessage('muted must be true or false'),
+  query('pinned').optional().isBoolean().withMessage('pinned must be true or false'),
+  query('type').optional().isIn(['private', 'group']).withMessage('type must be private or group'),
+  query('q').optional().trim().isLength({ min: 1, max: 80 }),
 ];
 
 const muteChatValidation = [
@@ -24,4 +29,3 @@ module.exports = {
   listChatValidation,
   muteChatValidation,
 };
-

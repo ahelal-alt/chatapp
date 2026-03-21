@@ -7,14 +7,34 @@ const getDashboardSummary = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Admin dashboard fetched successfully', summary));
 });
 
+const getAnalytics = asyncHandler(async (req, res) => {
+  const analytics = await service.getAnalytics(req.query);
+  res.json(new ApiResponse('Admin analytics fetched successfully', analytics));
+});
+
 const listUsers = asyncHandler(async (req, res) => {
   const result = await service.listUsers(req.query);
   res.json(new ApiResponse('Users fetched successfully', result.items, result.meta));
 });
 
+const getUserDetails = asyncHandler(async (req, res) => {
+  const result = await service.getUserDetails(req.params.userId);
+  res.json(new ApiResponse('User fetched successfully', result));
+});
+
 const listReports = asyncHandler(async (req, res) => {
   const result = await service.listReports(req.query);
   res.json(new ApiResponse('Reports fetched successfully', result.items, result.meta));
+});
+
+const getReportDetails = asyncHandler(async (req, res) => {
+  const report = await service.getReportDetails(req.params.reportId);
+  res.json(new ApiResponse('Report fetched successfully', report));
+});
+
+const reviewReport = asyncHandler(async (req, res) => {
+  const report = await service.reviewReport(req.user._id, req.params.reportId, req.body);
+  res.json(new ApiResponse('Report updated successfully', report));
 });
 
 const suspendUser = asyncHandler(async (req, res) => {
@@ -34,8 +54,12 @@ const deleteMessage = asyncHandler(async (req, res) => {
 
 module.exports = {
   getDashboardSummary,
+  getAnalytics,
   listUsers,
+  getUserDetails,
   listReports,
+  getReportDetails,
+  reviewReport,
   suspendUser,
   activateUser,
   deleteMessage,

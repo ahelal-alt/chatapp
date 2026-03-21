@@ -23,13 +23,21 @@ const listPinnedMessages = asyncHandler(async (req, res) => {
 });
 
 const listSharedFiles = asyncHandler(async (req, res) => {
-  const result = await service.listSharedFiles(req.user._id, req.query);
+  const result = await service.listSharedFiles(req.user._id, {
+    ...req.query,
+    ...(req.params.chatId ? { chatId: req.params.chatId } : {}),
+  });
   res.json(new ApiResponse('Shared files fetched successfully', result.items, result.meta));
 });
 
 const getMessage = asyncHandler(async (req, res) => {
   const message = await service.getMessageById(req.user._id, req.params.messageId);
   res.json(new ApiResponse('Message fetched successfully', message));
+});
+
+const getMediaDetails = asyncHandler(async (req, res) => {
+  const media = await service.getMediaDetails(req.user._id, req.params.messageId);
+  res.json(new ApiResponse('Media fetched successfully', media));
 });
 
 const editMessage = asyncHandler(async (req, res) => {
@@ -94,6 +102,7 @@ module.exports = {
   listPinnedMessages,
   listSharedFiles,
   getMessage,
+  getMediaDetails,
   editMessage,
   pinMessage,
   unpinMessage,

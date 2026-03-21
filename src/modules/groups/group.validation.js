@@ -52,6 +52,23 @@ const listGroupsValidation = [
   query('limit').optional().isInt({ min: 1, max: 100 }),
 ];
 
+const submitJoinRequestValidation = [
+  ...groupIdValidation,
+  body('message').optional().isString().trim().isLength({ max: 300 }),
+];
+
+const listJoinRequestsValidation = [
+  ...groupIdValidation,
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 100 }),
+  query('status').optional().isIn(['pending', 'approved', 'rejected', 'cancelled']),
+];
+
+const reviewJoinRequestValidation = [
+  ...groupIdValidation,
+  param('requestId').isMongoId().withMessage('Invalid request id'),
+];
+
 module.exports = {
   listGroupsValidation,
   createGroupValidation,
@@ -61,4 +78,7 @@ module.exports = {
   transferOwnershipValidation: memberActionValidation,
   addMembersValidation,
   inviteCodeValidation,
+  submitJoinRequestValidation,
+  listJoinRequestsValidation,
+  reviewJoinRequestValidation,
 };

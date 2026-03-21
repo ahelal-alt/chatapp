@@ -24,8 +24,22 @@ const reportSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['open', 'reviewed', 'resolved'],
+      enum: ['open', 'reviewed', 'resolved', 'dismissed'],
       default: 'open',
+    },
+    moderationNotes: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    reviewedByUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    reviewedAt: {
+      type: Date,
+      default: null,
     },
   },
   {
@@ -37,4 +51,3 @@ const reportSchema = new mongoose.Schema(
 );
 
 module.exports = mongoose.model('Report', reportSchema);
-
