@@ -123,11 +123,17 @@ async function getPublicProfile(viewerId, userId) {
 
 async function searchUsers(viewerId, queryParams) {
   const { page, limit, skip } = getPagination(queryParams);
-  const searchRegex = new RegExp(escapeRegex(queryParams.query), 'i');
+  const rawQuery = String(queryParams.query || '').trim();
+  const normalizedQuery = rawQuery.replace(/^@+/, '');
+  const searchRegex = new RegExp(escapeRegex(normalizedQuery), 'i');
   const criteria = {
     _id: { $ne: viewerId },
     isActive: true,
-    $or: [{ username: searchRegex }, { fullName: searchRegex }],
+    $or: [
+      { username: searchRegex },
+      { fullName: searchRegex },
+      { email: searchRegex },
+    ],
   };
 
   const [users, total] = await Promise.all([

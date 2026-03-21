@@ -24,6 +24,7 @@ const appState = {
   },
   socket: null,
   forms: {},
+  formErrors: {},
   mobileMessagesView: 'list',
   unreadCount: 0,
   typingByChat: {},
@@ -37,6 +38,7 @@ const appState = {
     messagesByChat: {},
     contacts: [],
     recentContacts: [],
+    directoryUsers: [],
     requests: {
       incoming: [],
       outgoing: [],
@@ -525,8 +527,21 @@ async function api(path, options = {}) {
     }
   }
 
+  if (response.status === 401 && auth) {
+    clearSession();
+    const authError = new Error('Your session has expired. Please sign in again.');
+    authError.formErrors = {};
+    authError.code = 'AUTH_EXPIRED';
+    if (appState.route?.name === 'app') {
+      navigate('/login', true);
+    }
+    throw authError;
+  }
+
   if (!response.ok) {
-    throw new Error(extractErrorMessage(payload) || 'Request failed');
+    const error = new Error(extractErrorMessage(payload) || 'Request failed');
+    error.formErrors = extractFieldErrors(payload);
+    throw error;
   }
 
   return payload.data !== undefined ? payload.data : payload;
@@ -577,6 +592,27 @@ function connectSocket() {
     auth: {
       token: appState.session.accessToken,
     },
+  });
+
+  socket.on('connect_error', async (error) => {
+    const message = error?.message || 'Realtime connection failed.';
+    if (/authentication/i.test(message) || /invalid authentication token/i.test(message)) {
+      const refreshed = await refreshSession();
+      if (refreshed) {
+        socket.auth = {
+          token: appState.session.accessToken,
+        };
+        socket.connect();
+        return;
+      }
+
+      clearSession();
+      showToast('Your session has expired. Please sign in again.');
+      navigate('/login', true);
+      return;
+    }
+
+    showToast(message);
   });
 
   socket.on('connection:init', () => {
@@ -978,6 +1014,12 @@ function onDocumentClick(event) {
     return;
   }
 
+  if (action === 'send-contact-request') {
+    event.preventDefault();
+    sendContactRequest(value);
+    return;
+  }
+
   if (action === 'request-action') {
     event.preventDefault();
     runRequestAction(actionTarget.dataset.kind, value);
@@ -1089,6 +1131,12 @@ function onDocumentInput(event) {
   appState.forms[formName][event.target.name] = event.target.type === 'checkbox'
     ? event.target.checked
     : event.target.value;
+  if (appState.formErrors[formName]?.[event.target.name]) {
+    delete appState.formErrors[formName][event.target.name];
+  }
+  if (appState.formErrors[formName]?.__form) {
+    delete appState.formErrors[formName].__form;
+  }
 }
 
 function onDocumentChange(event) {
@@ -1121,6 +1169,7 @@ async function onDocumentSubmit(event) {
   const data = new FormData(form);
 
   try {
+    appState.formErrors[formName] = {};
     appState.loading = true;
     render();
 
@@ -1158,6 +1207,9 @@ async function onDocumentSubmit(event) {
       case 'join-group':
         await submitJoinGroup(data);
         break;
+      case 'contact-search':
+        await searchDirectory(data);
+        break;
       case 'search-files':
         await loadFiles();
         break;
@@ -1174,6 +1226,9 @@ async function onDocumentSubmit(event) {
         break;
     }
   } catch (error) {
+    if (error.formErrors) {
+      appState.formErrors[formName] = error.formErrors;
+    }
     showToast(error.message || 'Something went wrong.');
   } finally {
     appState.loading = false;
@@ -1212,8 +1267,13 @@ async function submitRegister(formData) {
 
   appState.forms['verify-email'] = {
     email: payload.email || '',
+    token: result?.devOnly?.verificationToken || '',
   };
-  showToast(result?.message || 'Account created. Verify your email to continue.');
+  showToast(
+    result?.devOnly?.verificationToken
+      ? `Development verification token: ${result.devOnly.verificationToken}`
+      : (result?.message || 'Account created. Verify your email to continue.'),
+  );
   navigate('/verify-email');
 }
 
@@ -1227,7 +1287,11 @@ async function submitForgotPassword(formData) {
     },
   });
 
-  showToast(result?.resetToken ? `Development reset token: ${result.resetToken}` : 'If the email exists, reset instructions were sent.');
+  showToast(
+    result?.devOnly?.resetToken
+      ? `Development reset token: ${result.devOnly.resetToken}`
+      : 'If the email exists, reset instructions were sent.',
+  );
 }
 
 async function submitResetPassword(formData) {
@@ -1509,9 +1573,36 @@ async function toggleContactMute(userId, isMuted) {
   render();
 }
 
+async function searchDirectory(formData) {
+  const payload = formDataToObject(formData);
+  const query = String(payload.query || '').trim();
+  const normalizedQuery = query.replace(/^@+/, '');
+
+  appState.forms['contact-search'] = { query };
+  if (!normalizedQuery) {
+    appState.data.directoryUsers = [];
+    render();
+    return;
+  }
+
+  const users = await api(`/users/search?query=${encodeURIComponent(normalizedQuery)}&limit=12`);
+  appState.data.directoryUsers = Array.isArray(users) ? users : [];
+}
+
+async function sendContactRequest(userId) {
+  await api('/contact-requests', {
+    method: 'POST',
+    body: { receiverId: userId },
+  });
+  await loadRequests();
+  showToast('Contact request sent successfully.');
+  render();
+}
+
 async function runRequestAction(kind, requestId) {
   const method = 'PUT';
   await api(`/contact-requests/${requestId}/${kind}`, { method });
+  await loadContacts();
   await loadRequests();
   render();
 }
@@ -1554,7 +1645,19 @@ async function resendVerificationEmail() {
     body: { email },
   });
 
-  showToast(result?.verificationToken ? `Development verification token: ${result.verificationToken}` : 'Verification email sent if the account is eligible.');
+  if (result?.devOnly?.verificationToken) {
+    appState.forms['verify-email'] = {
+      ...(appState.forms['verify-email'] || {}),
+      email,
+      token: result.devOnly.verificationToken,
+    };
+  }
+
+  showToast(
+    result?.devOnly?.verificationToken
+      ? `Development verification token: ${result.devOnly.verificationToken}`
+      : 'Verification email sent if the account is eligible.',
+  );
 }
 
 async function clearActiveChat() {
@@ -1716,13 +1819,27 @@ function extractErrorMessage(payload) {
   if (!payload) {
     return '';
   }
+  if (Array.isArray(payload.errors) && payload.errors.length) {
+    return payload.errors[0].message || payload.errors[0].msg || payload.message || 'Request failed';
+  }
   if (payload.message) {
     return payload.message;
   }
-  if (Array.isArray(payload.errors) && payload.errors.length) {
-    return payload.errors[0].msg || payload.errors[0].message || 'Request failed';
-  }
   return '';
+}
+
+function extractFieldErrors(payload) {
+  if (!payload || !Array.isArray(payload.errors)) {
+    return {};
+  }
+
+  return payload.errors.reduce((accumulator, error) => {
+    const fieldName = error.field || error.path || '__form';
+    if (!accumulator[fieldName]) {
+      accumulator[fieldName] = error.message || error.msg || 'Invalid value';
+    }
+    return accumulator;
+  }, {});
 }
 
 function formDataToObject(formData) {
@@ -1770,6 +1887,29 @@ function normalizeChat(chat, viewer) {
     image,
     otherUserId: isGroup ? '' : String(counterpart?._id || counterpart?.id || ''),
   };
+}
+
+function getContactRelationship(userId) {
+  const normalizedUserId = String(userId || '');
+  const currentUserId = String(appState.data.me?._id || appState.data.me?.id || '');
+
+  if (!normalizedUserId) {
+    return 'unknown';
+  }
+  if (normalizedUserId === currentUserId) {
+    return 'self';
+  }
+  if (appState.data.contacts.some((contact) => String(contact.contactUserId?._id || contact.contactUserId?.id || contact.contactUserId || '') === normalizedUserId)) {
+    return 'contact';
+  }
+  if (appState.data.requests.outgoing.some((request) => String(request.receiverId?._id || request.receiverId?.id || request.receiverId || '') === normalizedUserId)) {
+    return 'outgoing';
+  }
+  if (appState.data.requests.incoming.some((request) => String(request.senderId?._id || request.senderId?.id || request.senderId || '') === normalizedUserId)) {
+    return 'incoming';
+  }
+
+  return 'available';
 }
 
 function formatMessagePreview(message) {
@@ -1992,18 +2132,20 @@ function renderLoginPage() {
 
 function renderRegisterPage() {
   const values = appState.forms.register || {};
+  const errors = appState.formErrors.register || {};
   return renderAuthScaffold({
     title: 'Create an account',
     subtitle: 'Join PulseChat with a premium, structured workspace experience.',
     form: `
       <form class="auth-form" data-form="register">
-        ${renderField('Full name', 'fullName', 'text', values.fullName || '', 'Alex Rivera')}
-        ${renderField('Username', 'username', 'text', values.username || '', 'alex_rivera')}
-        ${renderField('Email', 'email', 'email', values.email || '', 'alex@company.com')}
+        ${renderField('Full name', 'fullName', 'text', values.fullName || '', 'Alex Rivera', errors.fullName)}
+        ${renderField('Username', 'username', 'text', values.username || '', 'alex_rivera', errors.username)}
+        ${renderField('Email', 'email', 'email', values.email || '', 'alex@company.com', errors.email)}
         <div class="split">
-          ${renderPasswordField('Password', 'password', values.password || '')}
-          ${renderPasswordField('Confirm password', 'confirmPassword', values.confirmPassword || '')}
+          ${renderPasswordField('Password', 'password', values.password || '', errors.password)}
+          ${renderPasswordField('Confirm password', 'confirmPassword', values.confirmPassword || '', errors.confirmPassword)}
         </div>
+        ${renderFormError(errors)}
         <button class="primary-button" type="submit">${appState.loading ? 'Creating account...' : 'Create account'}</button>
       </form>
     `,
@@ -2013,12 +2155,14 @@ function renderRegisterPage() {
 
 function renderForgotPasswordPage() {
   const values = appState.forms['forgot-password'] || {};
+  const errors = appState.formErrors['forgot-password'] || {};
   return renderAuthScaffold({
     title: 'Reset your password',
     subtitle: 'Enter your email and we will send reset instructions if the account exists.',
     form: `
       <form class="auth-form" data-form="forgot-password">
-        ${renderField('Email', 'email', 'email', values.email || '', 'name@company.com')}
+        ${renderField('Email', 'email', 'email', values.email || '', 'name@company.com', errors.email)}
+        ${renderFormError(errors)}
         <button class="primary-button" type="submit">${appState.loading ? 'Sending...' : 'Send reset link'}</button>
       </form>
     `,
@@ -2028,14 +2172,16 @@ function renderForgotPasswordPage() {
 
 function renderResetPasswordPage() {
   const values = appState.forms['reset-password'] || {};
+  const errors = appState.formErrors['reset-password'] || {};
   return renderAuthScaffold({
     title: 'Choose a new password',
     subtitle: 'Use the reset token from email, then set a fresh password.',
     form: `
       <form class="auth-form" data-form="reset-password">
-        ${renderField('Reset token', 'token', 'text', values.token || '', 'paste your token')}
-        ${renderPasswordField('New password', 'password', values.password || '')}
-        ${renderPasswordField('Confirm password', 'confirmPassword', values.confirmPassword || '')}
+        ${renderField('Reset token', 'token', 'text', values.token || '', 'paste your token', errors.token)}
+        ${renderPasswordField('New password', 'password', values.password || '', errors.password)}
+        ${renderPasswordField('Confirm password', 'confirmPassword', values.confirmPassword || '', errors.confirmPassword)}
+        ${renderFormError(errors)}
         <button class="primary-button" type="submit">${appState.loading ? 'Resetting...' : 'Reset password'}</button>
       </form>
     `,
@@ -2045,6 +2191,7 @@ function renderResetPasswordPage() {
 
 function renderVerifyEmailPage() {
   const values = appState.forms['verify-email'] || {};
+  const errors = appState.formErrors['verify-email'] || {};
   return renderAuthScaffold({
     title: 'Verify your email',
     subtitle: 'We sent a verification link to your inbox. You can paste the token here or request another email.',
@@ -2058,12 +2205,13 @@ function renderVerifyEmailPage() {
           <span class="pill">Email required</span>
         </div>
         <div class="stack" style="gap:0.75rem;">
-          ${renderField('Email', 'email', 'email', values.email || '', 'name@company.com')}
+          ${renderField('Email', 'email', 'email', values.email || '', 'name@company.com', errors.email)}
           <button class="surface-button" type="button" data-action="resend-verification">${appState.loading ? 'Sending...' : 'Resend verification email'}</button>
         </div>
       </div>
       <form class="auth-form" data-form="verify-email">
-        ${renderField('Verification token', 'token', 'text', values.token || '', 'paste your token')}
+        ${renderField('Verification token', 'token', 'text', values.token || '', 'paste your token', errors.token)}
+        ${renderFormError(errors)}
         <button class="primary-button" type="submit">${appState.loading ? 'Verifying...' : 'Verify email'}</button>
       </form>
     `,
@@ -2076,6 +2224,8 @@ function renderInvitePage() {
   const inviteToken = appState.route.params.token;
   const registerValues = appState.forms['invite-register'] || {};
   const loginValues = appState.forms['invite-login'] || {};
+  const registerErrors = appState.formErrors['invite-register'] || {};
+  const loginErrors = appState.formErrors['invite-login'] || {};
 
   if (appState.loading && !invite) {
     return renderAuthScaffold({
@@ -2126,10 +2276,11 @@ function renderInvitePage() {
               <span class="pill pill--primary">New teammate</span>
             </div>
             <form class="auth-form" data-form="invite-register">
-              ${renderField('Full name', 'fullName', 'text', registerValues.fullName || '', 'Alex Rivera')}
-              ${renderField('Username', 'username', 'text', registerValues.username || '', 'alex_rivera')}
-              ${renderPasswordField('Password', 'password', registerValues.password || '')}
-              ${renderPasswordField('Confirm password', 'confirmPassword', registerValues.confirmPassword || '')}
+              ${renderField('Full name', 'fullName', 'text', registerValues.fullName || '', 'Alex Rivera', registerErrors.fullName)}
+              ${renderField('Username', 'username', 'text', registerValues.username || '', 'alex_rivera', registerErrors.username)}
+              ${renderPasswordField('Password', 'password', registerValues.password || '', registerErrors.password)}
+              ${renderPasswordField('Confirm password', 'confirmPassword', registerValues.confirmPassword || '', registerErrors.confirmPassword)}
+              ${renderFormError(registerErrors)}
               <button class="primary-button" type="submit">${appState.loading ? 'Creating account...' : 'Create account and join'}</button>
             </form>
           </div>
@@ -2144,12 +2295,13 @@ function renderInvitePage() {
               <span class="pill">Existing user</span>
             </div>
             <form class="auth-form" data-form="invite-login">
-              ${renderField('Email', 'email', 'email', loginValues.email || invite.email || '', 'name@company.com')}
-              ${renderPasswordField('Password', 'password', loginValues.password || '')}
+              ${renderField('Email', 'email', 'email', loginValues.email || invite.email || '', 'name@company.com', loginErrors.email)}
+              ${renderPasswordField('Password', 'password', loginValues.password || '', loginErrors.password)}
               <label class="pill" style="width:fit-content;">
                 <input type="checkbox" name="rememberMe" ${loginValues.rememberMe ? 'checked' : ''}/>
                 <span>Remember me</span>
               </label>
+              ${renderFormError(loginErrors)}
               <button class="primary-button" type="submit">${appState.loading ? 'Signing in...' : 'Sign in and accept invite'}</button>
             </form>
           </div>
@@ -2161,16 +2313,17 @@ function renderInvitePage() {
   });
 }
 
-function renderField(label, name, type, value, placeholder) {
+function renderField(label, name, type, value, placeholder, error = '') {
   return `
     <label class="field">
       <span class="field__label">${escapeHtml(label)}</span>
       <input class="input" type="${escapeHtml(type)}" name="${escapeHtml(name)}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder || '')}" />
+      ${error ? `<span class="field__error">${escapeHtml(error)}</span>` : ''}
     </label>
   `;
 }
 
-function renderPasswordField(label, name, value) {
+function renderPasswordField(label, name, value, error = '') {
   return `
     <label class="field">
       <span class="field__label">${escapeHtml(label)}</span>
@@ -2180,8 +2333,13 @@ function renderPasswordField(label, name, value) {
           <span class="material-symbols-outlined">visibility</span>
         </button>
       </div>
+      ${error ? `<span class="field__error">${escapeHtml(error)}</span>` : ''}
     </label>
   `;
+}
+
+function renderFormError(errors = {}) {
+  return errors.__form ? `<div class="form-error">${escapeHtml(errors.__form)}</div>` : '';
 }
 
 function renderWorkspace() {
@@ -2408,6 +2566,36 @@ function renderContactRow(contact, compact = false) {
           <button class="icon-button" data-action="mute-contact" data-value="${escapeHtml(user?._id || '')}" data-muted="${muted}" title="Mute"><span class="material-symbols-outlined">${muted ? 'notifications_off' : 'notifications'}</span></button>
         </div>
       `}
+    </div>
+  `;
+}
+
+function renderDirectoryRow(user) {
+  const relationship = getContactRelationship(user?._id || user?.id);
+  let actionMarkup = '';
+
+  if (relationship === 'contact') {
+    actionMarkup = '<span class="pill">Contact</span>';
+  } else if (relationship === 'outgoing') {
+    actionMarkup = '<span class="pill">Pending</span>';
+  } else if (relationship === 'incoming') {
+    actionMarkup = '<button class="surface-button" type="button" data-action="section" data-value="requests">Review request</button>';
+  } else if (relationship === 'self') {
+    actionMarkup = '<span class="pill">You</span>';
+  } else {
+    actionMarkup = `<button class="surface-button" type="button" data-action="send-contact-request" data-value="${escapeHtml(user?._id || user?.id || '')}">Send request</button>`;
+  }
+
+  return `
+    <div class="person-row">
+      <div class="avatar">${user?.profileImage ? `<img src="${escapeHtml(user.profileImage)}" alt="${escapeHtml(user.fullName || 'user')}" />` : escapeHtml(initials(user?.fullName || 'US'))}</div>
+      <div class="list__meta">
+        <div class="list__title">${escapeHtml(user?.fullName || 'User')}</div>
+        <div class="list__preview">${escapeHtml(user?.username ? `@${user.username}` : user?.email || 'Workspace member')}</div>
+      </div>
+      <div class="topbar__actions">
+        ${actionMarkup}
+      </div>
     </div>
   `;
 }
@@ -2650,6 +2838,7 @@ function renderMessageFile(message, outgoing) {
 }
 
 function renderContactsPanel() {
+  const searchQuery = appState.forms['contact-search']?.query || '';
   return `
     <section class="panel">
       <div class="panel__header">
@@ -2662,6 +2851,18 @@ function renderContactsPanel() {
       </div>
       <div class="panel__body">
         <div class="page">
+          <div class="card card--soft">
+            <h3 class="card__title">Find people</h3>
+            <form class="form" data-form="contact-search">
+              ${renderField('Search by name or username', 'query', 'text', searchQuery, 'Search teammates')}
+              <button class="primary-button" type="submit">${appState.loading ? 'Searching...' : 'Search'}</button>
+            </form>
+            <div class="stack" style="margin-top:1rem;">
+              ${searchQuery && !appState.data.directoryUsers.length
+                ? '<div class="muted">No users found for this search yet.</div>'
+                : appState.data.directoryUsers.map((user) => renderDirectoryRow(user)).join('')}
+            </div>
+          </div>
           <div class="card card--soft">
             <div class="topbar">
               <div>

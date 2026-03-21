@@ -7,7 +7,7 @@ const morgan = require('morgan');
 const mongoSanitize = require('express-mongo-sanitize');
 const env = require('./config/env');
 const { setupSwagger } = require('./docs/swagger');
-const { apiRateLimit, authRateLimit } = require('./middleware/rateLimit.middleware');
+const { apiRateLimit } = require('./middleware/rateLimit.middleware');
 const { notFoundHandler, errorHandler } = require('./middleware/error.middleware');
 
 const authRoutes = require('./modules/auth/auth.routes');
@@ -37,7 +37,6 @@ app.use(morgan(env.nodeEnv === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(mongoSanitize());
-app.use(apiRateLimit);
 app.use(`/${env.uploadDir}`, express.static(path.resolve(process.cwd(), env.uploadDir)));
 app.use(express.static(publicDir));
 
@@ -52,7 +51,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.use('/api/v1/auth', authRateLimit, authRoutes);
+app.use('/api/v1', apiRateLimit);
+app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/privacy', privacyRoutes);
 app.use('/api/v1/contact-requests', contactRequestRoutes);

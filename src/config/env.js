@@ -32,9 +32,22 @@ module.exports = {
   smtp: {
     host: process.env.SMTP_HOST || '',
     port: Number(process.env.SMTP_PORT) || 587,
+    authMethod: process.env.SMTP_AUTH_METHOD || 'password',
     user: process.env.SMTP_USER || '',
     pass: process.env.SMTP_PASS || '',
     from: process.env.SMTP_FROM || '',
+    oauth2: {
+      clientId: process.env.SMTP_OAUTH2_CLIENT_ID || '',
+      clientSecret: process.env.SMTP_OAUTH2_CLIENT_SECRET || '',
+      refreshToken: process.env.SMTP_OAUTH2_REFRESH_TOKEN || '',
+      accessToken: process.env.SMTP_OAUTH2_ACCESS_TOKEN || '',
+      tenantId: process.env.SMTP_OAUTH2_TENANT_ID || '',
+    },
+  },
+  email: {
+    provider: process.env.EMAIL_PROVIDER || 'smtp',
+    resendApiKey: process.env.RESEND_API_KEY || '',
+    resendFrom: process.env.RESEND_FROM || 'onboarding@resend.dev',
   },
   storageDriver: process.env.STORAGE_DRIVER || 'local',
   uploadDir: process.env.UPLOAD_DIR || 'uploads',

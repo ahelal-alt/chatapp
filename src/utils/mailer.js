@@ -1,11 +1,41 @@
 const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const env = require('../config/env');
 const auditLog = require('./audit');
 
 let transport;
+let resendClient;
+
+function getEmailProvider() {
+  return String(env.email.provider || 'smtp').toLowerCase();
+}
+
+function isResendConfigured() {
+  return Boolean(env.email.resendApiKey && env.email.resendFrom);
+}
+
+function isOauth2Configured() {
+  return Boolean(
+    env.smtp.host
+      && env.smtp.port
+      && env.smtp.user
+      && (env.smtp.from || env.smtp.user)
+      && env.smtp.oauth2.clientId
+      && env.smtp.oauth2.clientSecret
+      && (env.smtp.oauth2.refreshToken || env.smtp.oauth2.accessToken),
+  );
+}
 
 function isSmtpConfigured() {
+  if (String(env.smtp.authMethod).toLowerCase() === 'oauth2') {
+    return isOauth2Configured();
+  }
+
   return Boolean(env.smtp.host && env.smtp.port && env.smtp.user && env.smtp.pass && (env.smtp.from || env.smtp.user));
+}
+
+function isEmailConfigured() {
+  return getEmailProvider() === 'resend' ? isResendConfigured() : isSmtpConfigured();
 }
 
 function getTransport() {
@@ -14,18 +44,45 @@ function getTransport() {
   }
 
   if (!transport) {
+    const port = Number(env.smtp.port);
+    const useOauth2 = String(env.smtp.authMethod).toLowerCase() === 'oauth2';
     transport = nodemailer.createTransport({
       host: env.smtp.host,
-      port: env.smtp.port,
-      secure: Number(env.smtp.port) === 465,
-      auth: {
-        user: env.smtp.user,
-        pass: env.smtp.pass,
-      },
+      port,
+      secure: port === 465,
+      requireTLS: port === 587,
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 15000,
+      auth: useOauth2
+        ? {
+          type: 'OAuth2',
+          user: env.smtp.user,
+          clientId: env.smtp.oauth2.clientId,
+          clientSecret: env.smtp.oauth2.clientSecret,
+          refreshToken: env.smtp.oauth2.refreshToken || undefined,
+          accessToken: env.smtp.oauth2.accessToken || undefined,
+        }
+        : {
+          user: env.smtp.user,
+          pass: env.smtp.pass,
+        },
     });
   }
 
   return transport;
+}
+
+function getResendClient() {
+  if (!isResendConfigured()) {
+    return null;
+  }
+
+  if (!resendClient) {
+    resendClient = new Resend(env.email.resendApiKey);
+  }
+
+  return resendClient;
 }
 
 function maskEmail(email) {
@@ -36,6 +93,22 @@ function maskEmail(email) {
   }
 
   return `${name.slice(0, 2)}***@${domain}`;
+}
+
+function getConfigurationFailureReason() {
+  if (getEmailProvider() === 'resend') {
+    return isResendConfigured() ? '' : 'resend_not_configured';
+  }
+
+  if (!env.smtp.host || !env.smtp.port || !env.smtp.user || !(env.smtp.from || env.smtp.user)) {
+    return 'smtp_not_configured';
+  }
+
+  if (String(env.smtp.authMethod).toLowerCase() === 'oauth2') {
+    return isOauth2Configured() ? '' : 'smtp_oauth2_not_configured';
+  }
+
+  return env.smtp.pass ? '' : 'smtp_password_not_configured';
 }
 
 function wrapHtml({ heading, intro, body, ctaLabel, ctaUrl, footer }) {
@@ -57,10 +130,11 @@ async function sendMail(message, options = {}) {
   const actorId = options.actorId || null;
   const category = options.category || 'general';
 
-  if (!isSmtpConfigured()) {
+  if (!isEmailConfigured()) {
+    const reason = getConfigurationFailureReason() || 'smtp_not_configured';
     auditLog('email.skipped', actorId, {
       category,
-      reason: 'smtp_not_configured',
+      reason,
       recipient: maskEmail(message.to),
     });
 
@@ -68,27 +142,44 @@ async function sendMail(message, options = {}) {
       status: 'skipped',
       configured: false,
       recipient: maskEmail(message.to),
-      reason: 'smtp_not_configured',
+      reason,
     };
   }
 
   try {
-    const info = await getTransport().sendMail({
-      from: env.smtp.from || env.smtp.user,
-      ...message,
-    });
+    let providerMessageId = '';
+    const provider = getEmailProvider();
+
+    if (provider === 'resend') {
+      const response = await getResendClient().emails.send({
+        from: env.email.resendFrom,
+        to: Array.isArray(message.to) ? message.to : [message.to],
+        subject: message.subject,
+        html: message.html,
+        text: message.text,
+      });
+      providerMessageId = response?.data?.id || response?.id || '';
+    } else {
+      const info = await getTransport().sendMail({
+        from: env.smtp.from || env.smtp.user,
+        ...message,
+      });
+      providerMessageId = info.messageId || '';
+    }
 
     auditLog('email.sent', actorId, {
       category,
       recipient: maskEmail(message.to),
-      messageId: info.messageId || '',
+      provider,
+      messageId: providerMessageId,
     });
 
     return {
       status: 'sent',
       configured: true,
       recipient: maskEmail(message.to),
-      messageId: info.messageId || '',
+      provider,
+      messageId: providerMessageId,
     };
   } catch (error) {
     auditLog('email.failed', actorId, {
@@ -100,6 +191,7 @@ async function sendMail(message, options = {}) {
     console.error('[EMAIL]', JSON.stringify({
       category,
       recipient: maskEmail(message.to),
+      provider: getEmailProvider(),
       code: error?.code || '',
       message: error?.message || 'Mail delivery failed',
     }));
@@ -207,6 +299,8 @@ async function sendInviteEmail({ to, inviteUrl, inviterName, actorId = null }) {
 
 module.exports = {
   isSmtpConfigured,
+  isEmailConfigured,
+  sendMail,
   sendVerificationEmail,
   sendPasswordResetEmail,
   sendInviteEmail,

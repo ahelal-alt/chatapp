@@ -1,4 +1,5 @@
 const rateLimit = require('express-rate-limit');
+const env = require('../config/env');
 
 function normalizeKey(value) {
   return String(value || '').trim().toLowerCase();
@@ -56,8 +57,12 @@ const verificationRateLimit = buildLimiter({
 
 const apiRateLimit = buildLimiter({
   windowMs: 15 * 60 * 1000,
-  max: 500,
+  max: env.nodeEnv === 'production' ? 1500 : 5000,
   message: 'Too many API requests. Please try again later.',
+  keyGenerator: (req) => {
+    const authKey = String(req.get('authorization') || '').slice(-32);
+    return `${req.ip}:${authKey || 'anonymous'}`;
+  },
 });
 
 module.exports = {
