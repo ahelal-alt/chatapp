@@ -4,6 +4,13 @@ const appState = {
   toast: null,
   invite: null,
   inviteError: '',
+  detailsDrawer: {
+    open: false,
+    kind: '',
+    loading: false,
+    error: '',
+    data: null,
+  },
   socket: null,
   forms: {},
   mobileMessagesView: 'list',
@@ -153,6 +160,7 @@ function navigate(path, replace = false) {
 
 async function handleRouteChange(initial = false) {
   appState.route = parseRoute();
+  closeDetailsDrawer(true);
 
   if (appState.route.name === 'app') {
     const okay = await ensureAuthenticated();
@@ -275,7 +283,9 @@ async function loadInviteLanding(token) {
 
 async function loadChats() {
   const result = await api('/chats?limit=50');
-  appState.data.chats = Array.isArray(result) ? result : [];
+  appState.data.chats = Array.isArray(result)
+    ? result.map((chat) => normalizeChat(chat, appState.data.me))
+    : [];
 }
 
 async function loadMessageSection(chatId) {
@@ -296,7 +306,7 @@ async function loadMessageSection(chatId) {
     api(`/messages/chat/${normalizedChatId}?limit=80`),
   ]);
 
-  appState.data.activeChat = chatDetails;
+  appState.data.activeChat = normalizeChat(chatDetails, appState.data.me);
   appState.data.messagesByChat[normalizedChatId] = Array.isArray(messagesResponse) ? messagesResponse : [];
 
   if (appState.socket) {
@@ -335,7 +345,46 @@ async function loadGroups(groupId) {
     return;
   }
 
-  appState.data.activeGroup = await api(`/groups/${chosenGroupId}`);
+  const groupDetails = await api(`/groups/${chosenGroupId}`);
+  appState.data.activeGroup = {
+    ...groupDetails,
+    memberCount: Array.isArray(groupDetails?.members) ? groupDetails.members.length : 0,
+  };
+}
+
+async function loadPrivateChatDetails() {
+  const chat = appState.data.activeChat;
+  const otherUserId = chat?.otherUserId;
+
+  if (!chat || !otherUserId) {
+    throw new Error('No private chat details are available.');
+  }
+
+  const [profile, mutualContacts, media] = await Promise.all([
+    api(`/users/${otherUserId}/profile`),
+    api(`/users/${otherUserId}/mutual-contacts`),
+    api(`/messages/chat/${String(chat.id || chat._id)}/media?limit=6`),
+  ]);
+
+  return {
+    profile,
+    mutualContacts: Array.isArray(mutualContacts) ? mutualContacts : [],
+    media: Array.isArray(media) ? media : [],
+    chat,
+  };
+}
+
+async function loadGroupDetailsDrawer(groupId) {
+  const details = await api(`/groups/${groupId}`);
+  const media = details?.group?.chatId?._id
+    ? await api(`/messages/chat/${String(details.group.chatId._id)}/media?limit=6`)
+    : [];
+
+  return {
+    group: details.group || null,
+    members: Array.isArray(details.members) ? details.members : [],
+    media: Array.isArray(media) ? media : [],
+  };
 }
 
 async function loadFiles() {
@@ -357,7 +406,11 @@ async function loadNotifications(force = false) {
 }
 
 async function loadProfile() {
-  appState.data.profile = await api('/users/me');
+  const profile = await api('/users/me');
+  appState.data.profile = profile?.user || profile || null;
+  if (profile?.privacy) {
+    appState.data.privacy = profile.privacy;
+  }
 }
 
 async function loadPrivacy() {
@@ -575,6 +628,61 @@ function disconnectSocket() {
   appState.socket = null;
 }
 
+function closeDetailsDrawer(silent = false) {
+  appState.detailsDrawer = {
+    open: false,
+    kind: '',
+    loading: false,
+    error: '',
+    data: null,
+  };
+
+  if (!silent) {
+    render();
+  }
+}
+
+async function openPrivateChatDetails() {
+  appState.detailsDrawer = {
+    open: true,
+    kind: 'private',
+    loading: true,
+    error: '',
+    data: null,
+  };
+  render();
+
+  try {
+    appState.detailsDrawer.data = await loadPrivateChatDetails();
+  } catch (error) {
+    appState.detailsDrawer.error = error.message || 'Unable to load contact details right now.';
+  } finally {
+    appState.detailsDrawer.loading = false;
+    render();
+  }
+}
+
+async function openGroupDetails(groupId) {
+  appState.detailsDrawer = {
+    open: true,
+    kind: 'group',
+    loading: true,
+    error: '',
+    data: null,
+  };
+  render();
+
+  try {
+    const targetGroupId = groupId || appState.data.activeGroup?.group?._id || appState.data.activeGroup?.group?.id;
+    appState.detailsDrawer.data = await loadGroupDetailsDrawer(targetGroupId);
+  } catch (error) {
+    appState.detailsDrawer.error = error.message || 'Unable to load group details right now.';
+  } finally {
+    appState.detailsDrawer.loading = false;
+    render();
+  }
+}
+
 function onDocumentClick(event) {
   const actionTarget = event.target.closest('[data-action]');
   if (!actionTarget) {
@@ -601,6 +709,24 @@ function onDocumentClick(event) {
     return;
   }
 
+  if (action === 'open-chat-details') {
+    event.preventDefault();
+    openPrivateChatDetails();
+    return;
+  }
+
+  if (action === 'open-group-details') {
+    event.preventDefault();
+    openGroupDetails(value);
+    return;
+  }
+
+  if (action === 'close-details') {
+    event.preventDefault();
+    closeDetailsDrawer();
+    return;
+  }
+
   if (action === 'back-chat-list') {
     event.preventDefault();
     appState.mobileMessagesView = 'list';
@@ -622,7 +748,7 @@ function onDocumentClick(event) {
 
   if (action === 'toggle-password') {
     event.preventDefault();
-    const input = actionTarget.closest('.field, .auth-form, .form')?.querySelector('input[type="password"], input[type="text"]');
+    const input = actionTarget.closest('.field')?.querySelector('input[type="password"], input[type="text"]');
     if (input) {
       input.type = input.type === 'password' ? 'text' : 'password';
       actionTarget.querySelector('.material-symbols-outlined').textContent = input.type === 'password' ? 'visibility' : 'visibility_off';
@@ -700,6 +826,18 @@ function onDocumentClick(event) {
   if (action === 'revoke-session') {
     event.preventDefault();
     revokeSession(value);
+    return;
+  }
+
+  if (action === 'resend-verification') {
+    event.preventDefault();
+    resendVerificationEmail();
+    return;
+  }
+
+  if (action === 'clear-chat') {
+    event.preventDefault();
+    clearActiveChat();
     return;
   }
 
@@ -1191,6 +1329,39 @@ async function revokeSession(sessionId) {
   render();
 }
 
+async function resendVerificationEmail() {
+  const email = String(appState.forms['verify-email']?.email || '').trim();
+  if (!email) {
+    showToast('Enter your email first so we know where to resend the verification.');
+    return;
+  }
+
+  const result = await api('/auth/resend-verification', {
+    method: 'POST',
+    auth: false,
+    body: { email },
+  });
+
+  showToast(result?.verificationToken ? `Development verification token: ${result.verificationToken}` : 'Verification email sent if the account is eligible.');
+}
+
+async function clearActiveChat() {
+  const chatId = String(appState.data.activeChat?.id || appState.data.activeChat?._id || '');
+  if (!chatId) {
+    return;
+  }
+
+  await api(`/chats/${chatId}/clear`, {
+    method: 'DELETE',
+  });
+
+  appState.data.messagesByChat[chatId] = [];
+  refreshChatPreview(chatId, null);
+  showToast('Chat history cleared for your account.');
+  closeDetailsDrawer(true);
+  render();
+}
+
 async function updateAdminUserStatus(userId, enabled) {
   await api(`/admin/users/${userId}/${enabled ? 'suspend' : 'activate'}`, {
     method: 'PUT',
@@ -1208,7 +1379,7 @@ function refreshChatPreview(chatId, message) {
     }
     return {
       ...chat,
-      lastMessagePreview: message.text || message.fileName || message.type || 'Message',
+      lastMessagePreview: formatMessagePreview(message),
       lastMessageAt: message.createdAt || new Date().toISOString(),
     };
   });
@@ -1252,6 +1423,101 @@ function inferMessageTypeFromMedia(asset) {
     return asset.mimeType?.startsWith('audio/') ? 'voice' : 'audio';
   }
   return 'file';
+}
+
+function normalizeChat(chat, viewer) {
+  if (!chat) {
+    return null;
+  }
+  const viewerId = String(viewer?._id || viewer?.id || '');
+  const members = Array.isArray(chat.memberIds) ? chat.memberIds : [];
+  const others = members.filter((member) => String(member?._id || member?.id || member) !== viewerId);
+  const counterpart = others[0] || null;
+  const isGroup = chat.type === 'group';
+  const groupTitle = chat.groupName || chat.name || '';
+  const title = isGroup
+    ? (groupTitle || chat.title || 'Group chat')
+    : (counterpart?.fullName || counterpart?.username || chat.title || 'Direct message');
+  const subtitle = isGroup
+    ? (chat.description || `${members.length} members`)
+    : (counterpart?.username ? `@${counterpart.username}` : (counterpart?.email || 'Private chat'));
+  const image = isGroup
+    ? (chat.image || '')
+    : (counterpart?.profileImage || '');
+
+  return {
+    ...chat,
+    id: String(chat.id || chat._id),
+    title,
+    subtitle,
+    image,
+    otherUserId: isGroup ? '' : String(counterpart?._id || counterpart?.id || ''),
+  };
+}
+
+function formatMessagePreview(message) {
+  if (!message) {
+    return 'Message';
+  }
+  if (message.isEncrypted) {
+    return 'Encrypted message';
+  }
+  if (message.text) {
+    return message.text;
+  }
+  if (message.fileName) {
+    return message.fileName;
+  }
+  if (message.type === 'voice') {
+    return 'Voice message';
+  }
+  if (message.type === 'image') {
+    return 'Image';
+  }
+  if (message.type === 'video') {
+    return 'Video';
+  }
+  if (message.type === 'audio') {
+    return 'Audio';
+  }
+  return message.type || 'Message';
+}
+
+function getNotificationVisual(notification) {
+  const map = {
+    mention: { icon: 'alternate_email', tone: 'primary' },
+    reaction: { icon: 'thumb_up', tone: 'primary' },
+    private_message: { icon: 'chat_bubble', tone: 'primary' },
+    group_message: { icon: 'forum', tone: 'primary' },
+    contact_request_received: { icon: 'person_add', tone: 'warning' },
+    contact_request_accepted: { icon: 'handshake', tone: 'success' },
+    group_join_request: { icon: 'groups', tone: 'warning' },
+    invite: { icon: 'mail', tone: 'primary' },
+    report: { icon: 'flag', tone: 'danger' },
+    moderation: { icon: 'gavel', tone: 'danger' },
+    call: { icon: 'call', tone: 'success' },
+  };
+  return map[notification?.type] || { icon: 'notifications', tone: 'primary' };
+}
+
+function getDashboardStats(dashboard) {
+  const totals = dashboard?.totals || {};
+  return [
+    { label: 'Total users', value: totals.users ?? 0, hint: `${totals.activeUsers ?? 0} active` },
+    { label: 'Chats', value: totals.chats ?? 0, hint: `${totals.groups ?? 0} groups` },
+    { label: 'Messages', value: totals.messages ?? 0, hint: 'All-time volume' },
+    { label: 'Open reports', value: totals.reports ?? 0, hint: `${totals.suspendedUsers ?? 0} suspended users` },
+  ];
+}
+
+function getChartBars(analytics, dashboard) {
+  const points = analytics?.messagesByDay || dashboard?.recentMessagesByDay || [];
+  const max = Math.max(...points.map((item) => item.count || 0), 1);
+  return points.slice(-7).map((item) => ({
+    label: item.date || '',
+    value: item.count || 0,
+    height: Math.max(12, Math.round(((item.count || 0) / max) * 100)),
+  }));
 }
 
 function escapeHtml(value) {
@@ -1336,22 +1602,45 @@ function renderCurrentView() {
 function renderAuthScaffold({ title, subtitle, form, footer, alert = '' }) {
   return `
     <div class="auth-shell">
-      <main class="auth-card">
-        ${alert ? `<div class="auth-banner"><span class="material-symbols-outlined">info</span><span>${escapeHtml(alert)}</span></div>` : ''}
-        <div class="auth-content">
-          <div class="auth-brand">
-            <h1 class="auth-brand__title">PulseChat</h1>
-            <p class="auth-brand__subtitle">Architecture for communication.</p>
-          </div>
-          <div class="stack" style="gap: 1.5rem;">
+      <main class="auth-layout">
+        <section class="auth-aside">
+          <div class="auth-aside__brand">
+            <div class="auth-aside__logo"><span class="material-symbols-outlined">bolt</span></div>
             <div>
-              <h2 class="headline" style="font-size:1.5rem;margin:0;">${escapeHtml(title)}</h2>
-              <p class="form-note">${escapeHtml(subtitle)}</p>
+              <div class="auth-aside__eyebrow">PulseChat</div>
+              <h1 class="auth-aside__title">Structured communication for fast teams.</h1>
             </div>
-            ${form}
-            <div class="auth-footer">${footer}</div>
           </div>
-        </div>
+          <p class="auth-aside__copy">Secure messaging, shared files, calls, notifications, and workspace onboarding in one clean product surface.</p>
+          <div class="auth-aside__metrics">
+            <div class="auth-metric">
+              <strong>Realtime</strong>
+              <span>Messaging, presence, calls, and notifications.</span>
+            </div>
+            <div class="auth-metric">
+              <strong>Secure</strong>
+              <span>Verification, sessions, resets, and private-chat support.</span>
+            </div>
+            <div class="auth-metric">
+              <strong>Designed to scale</strong>
+              <span>Contacts, groups, files, admin controls, and onboarding.</span>
+            </div>
+          </div>
+        </section>
+        <section class="auth-card">
+          ${alert ? `<div class="auth-banner"><span class="material-symbols-outlined">info</span><span>${escapeHtml(alert)}</span></div>` : ''}
+          <div class="auth-content">
+            <div class="auth-brand">
+              <span class="pill pill--primary">Workspace access</span>
+              <h2 class="headline" style="font-size:1.7rem;margin:0.8rem 0 0;">${escapeHtml(title)}</h2>
+              <p class="auth-brand__subtitle">${escapeHtml(subtitle)}</p>
+            </div>
+            <div class="stack" style="gap: 1.5rem;">
+              ${form}
+              <div class="auth-footer">${footer}</div>
+            </div>
+          </div>
+        </section>
       </main>
       <div class="auth-meta">
         <span>Secure TLS</span>
@@ -1439,14 +1728,27 @@ function renderVerifyEmailPage() {
   const values = appState.forms['verify-email'] || {};
   return renderAuthScaffold({
     title: 'Verify your email',
-    subtitle: 'Paste the verification token from your inbox to activate your account.',
+    subtitle: 'We sent a verification link to your inbox. You can paste the token here or request another email.',
     form: `
+      <div class="card card--soft" data-form="verify-email">
+        <div class="topbar" style="margin-bottom:0.75rem;">
+          <div>
+            <div class="list__title">Verification in progress</div>
+            <div class="muted">Use the same email address you registered with.</div>
+          </div>
+          <span class="pill">Email required</span>
+        </div>
+        <div class="stack" style="gap:0.75rem;">
+          ${renderField('Email', 'email', 'email', values.email || '', 'name@company.com')}
+          <button class="surface-button" type="button" data-action="resend-verification">${appState.loading ? 'Sending...' : 'Resend verification email'}</button>
+        </div>
+      </div>
       <form class="auth-form" data-form="verify-email">
         ${renderField('Verification token', 'token', 'text', values.token || '', 'paste your token')}
         <button class="primary-button" type="submit">${appState.loading ? 'Verifying...' : 'Verify email'}</button>
       </form>
     `,
-    footer: `Need a new token? Use the resend flow from your account session or contact support.`,
+    footer: `<a class="auth-link" href="/login" data-action="navigate" data-value="/login">Back to login</a>`,
   });
 }
 
@@ -1477,36 +1779,61 @@ function renderInvitePage() {
   const statusPillClass = invite.status === 'pending' ? 'pill--primary' : invite.status === 'accepted' ? '' : 'pill--danger';
 
   return renderAuthScaffold({
-    title: 'You were invited to PulseChat',
-    subtitle: invite.workspace?.name ? `Join ${invite.workspace.name} as ${invite.role || 'member'}.` : 'Complete onboarding to join this workspace.',
+    title: 'Join your team in PulseChat',
+    subtitle: invite.workspace?.name ? `You were invited to ${invite.workspace.name}. Choose the right next step below.` : 'Complete onboarding to join this workspace.',
     form: `
-      <div class="stack">
-        <div class="card card--soft">
-          <div class="stack" style="gap:0.55rem;">
-            <div class="pill ${statusPillClass}">${escapeHtml(invite.status)}</div>
-            <div><strong>${escapeHtml(invite.email || '')}</strong></div>
-            <div class="muted">Invited by ${escapeHtml(invite.inviter?.fullName || 'PulseChat')}</div>
+      <div class="stack auth-invite-flow">
+        <div class="card card--soft auth-invite-summary">
+          <div class="auth-invite-summary__main">
+            <div class="auth-invite-summary__avatar">${escapeHtml(initials(invite.workspace?.name || 'PC'))}</div>
+            <div class="stack" style="gap:0.35rem;">
+              <div class="pill ${statusPillClass}">${escapeHtml(invite.status)}</div>
+              <div class="list__title">${escapeHtml(invite.workspace?.name || 'PulseChat Workspace')}</div>
+              <div class="muted">Invited by ${escapeHtml(invite.inviter?.fullName || 'PulseChat')} · Role: ${escapeHtml(invite.role || 'member')}</div>
+            </div>
+          </div>
+          <div class="auth-invite-summary__meta">
+            <span>${escapeHtml(invite.email || '')}</span>
+            <span>${escapeHtml(invite.nextAction?.replace(/_/g, ' ') || 'continue')}</span>
           </div>
         </div>
         ${invite.canRegister ? `
-          <form class="auth-form" data-form="invite-register">
-            ${renderField('Full name', 'fullName', 'text', registerValues.fullName || '', 'Alex Rivera')}
-            ${renderField('Username', 'username', 'text', registerValues.username || '', 'alex_rivera')}
-            ${renderPasswordField('Password', 'password', registerValues.password || '')}
-            ${renderPasswordField('Confirm password', 'confirmPassword', registerValues.confirmPassword || '')}
-            <button class="primary-button" type="submit">${appState.loading ? 'Creating account...' : 'Create account and join'}</button>
-          </form>
+          <div class="card auth-flow-card">
+            <div class="topbar" style="margin-bottom:0;">
+              <div>
+                <div class="list__title">Create your account</div>
+                <div class="muted">This invite is reserved for ${escapeHtml(invite.email || 'your email')}.</div>
+              </div>
+              <span class="pill pill--primary">New teammate</span>
+            </div>
+            <form class="auth-form" data-form="invite-register">
+              ${renderField('Full name', 'fullName', 'text', registerValues.fullName || '', 'Alex Rivera')}
+              ${renderField('Username', 'username', 'text', registerValues.username || '', 'alex_rivera')}
+              ${renderPasswordField('Password', 'password', registerValues.password || '')}
+              ${renderPasswordField('Confirm password', 'confirmPassword', registerValues.confirmPassword || '')}
+              <button class="primary-button" type="submit">${appState.loading ? 'Creating account...' : 'Create account and join'}</button>
+            </form>
+          </div>
         ` : ''}
         ${invite.canLogin || invite.nextAction === 'sign_in' ? `
-          <form class="auth-form" data-form="invite-login">
-            ${renderField('Email', 'email', 'email', loginValues.email || invite.email || '', 'name@company.com')}
-            ${renderPasswordField('Password', 'password', loginValues.password || '')}
-            <label class="pill" style="width:fit-content;">
-              <input type="checkbox" name="rememberMe" ${loginValues.rememberMe ? 'checked' : ''}/>
-              <span>Remember me</span>
-            </label>
-            <button class="primary-button" type="submit">${appState.loading ? 'Signing in...' : 'Sign in and accept invite'}</button>
-          </form>
+          <div class="card auth-flow-card">
+            <div class="topbar" style="margin-bottom:0;">
+              <div>
+                <div class="list__title">Already have an account?</div>
+                <div class="muted">Sign in with the invited email to accept the workspace access.</div>
+              </div>
+              <span class="pill">Existing user</span>
+            </div>
+            <form class="auth-form" data-form="invite-login">
+              ${renderField('Email', 'email', 'email', loginValues.email || invite.email || '', 'name@company.com')}
+              ${renderPasswordField('Password', 'password', loginValues.password || '')}
+              <label class="pill" style="width:fit-content;">
+                <input type="checkbox" name="rememberMe" ${loginValues.rememberMe ? 'checked' : ''}/>
+                <span>Remember me</span>
+              </label>
+              <button class="primary-button" type="submit">${appState.loading ? 'Signing in...' : 'Sign in and accept invite'}</button>
+            </form>
+          </div>
         ` : ''}
         ${invite.canAccept ? `<button class="primary-button" type="button" data-action="invite-accept" data-value="${escapeHtml(inviteToken)}">Accept invite</button>` : ''}
       </div>
@@ -1546,6 +1873,7 @@ function renderWorkspace() {
         ${renderRail()}
         ${renderPanel()}
       </div>
+      ${renderDetailsDrawer()}
     </div>
     ${renderMobileTabs()}
   `;
@@ -1634,6 +1962,10 @@ function renderMessagesRail() {
           <h1 class="headline">Messages</h1>
           <button class="surface-button" type="button" data-action="section" data-value="contacts">New chat</button>
         </div>
+        <div class="rail__summary">
+          <span class="pill pill--primary">${appState.data.chats.filter((chat) => chat.unreadCount).length} unread</span>
+          <span class="pill">${appState.data.chats.filter((chat) => chat.type === 'group').length} groups</span>
+        </div>
         <div class="rail__search-wrap">
           <span class="material-symbols-outlined rail__search-icon">search</span>
           <input class="rail__search" type="search" name="q" form="messages-search-form" value="${escapeHtml(searchValue)}" placeholder="Search conversations" />
@@ -1670,6 +2002,10 @@ function renderChatRow(chat) {
           <span class="list__time">${escapeHtml(formatTime(chat.lastMessageAt) || formatDate(chat.lastMessageAt))}</span>
         </div>
         <div class="list__preview">${escapeHtml(appState.typingByChat[id] ? `${appState.typingByChat[id]} is typing…` : (chat.lastMessagePreview || chat.subtitle || 'No messages yet'))}</div>
+        <div class="list__badges">
+          ${chat.participantSettings?.pinnedAt ? '<span class="pill">Pinned</span>' : ''}
+          ${chat.participantSettings?.mutedUntil && new Date(chat.participantSettings.mutedUntil) > new Date() ? '<span class="pill">Muted</span>' : ''}
+        </div>
       </div>
       ${chat.unreadCount ? `<span class="badge">${escapeHtml(chat.unreadCount)}</span>` : ''}
     </button>
@@ -1866,16 +2202,25 @@ function renderMessagesPanel() {
           <div class="avatar ${chat.type === 'group' ? 'avatar--square' : ''}">${chat.image ? `<img src="${escapeHtml(chat.image)}" alt="${escapeHtml(chat.title || 'chat')}" />` : escapeHtml(initials(chat.title || 'CH'))}</div>
           <div>
             <h2 class="headline" style="font-size:1.2rem;margin:0;">${escapeHtml(chat.title || 'Conversation')}</h2>
-            <div class="muted">${escapeHtml(chat.type === 'group' ? chat.subtitle || 'Group conversation' : (appState.typingByChat[chatId] ? `${appState.typingByChat[chatId]} is typing…` : 'Private conversation'))}</div>
+            <div class="muted">${escapeHtml(chat.type === 'group' ? chat.subtitle || 'Group conversation' : (appState.typingByChat[chatId] ? `${appState.typingByChat[chatId]} is typing…` : (chat.subtitle || 'Private conversation')))}</div>
           </div>
         </div>
         <div class="panel__header-actions">
+          <button class="icon-button" title="Search in conversation"><span class="material-symbols-outlined">search</span></button>
+          <button class="icon-button" title="Call"><span class="material-symbols-outlined">call</span></button>
+          ${chat.type === 'private' ? '<button class="icon-button" type="button" data-action="open-chat-details" title="Details"><span class="material-symbols-outlined">info</span></button>' : ''}
           <button class="icon-button" data-action="section" data-value="files" title="Files"><span class="material-symbols-outlined">folder_open</span></button>
           <button class="icon-button" data-action="section" data-value="notifications" title="Notifications"><span class="material-symbols-outlined">notifications</span></button>
         </div>
       </header>
       <div class="panel__body panel__body--messages">
         <div class="thread">
+          ${chat.type === 'private' ? `
+            <div class="thread__encryption">
+              <span class="material-symbols-outlined">lock</span>
+              <span>This private conversation supports end-to-end encrypted messages.</span>
+            </div>
+          ` : ''}
           <div class="thread__separator">${escapeHtml(formatDate(new Date()))}</div>
           ${messages.length ? messages.map((message) => renderMessage(message)).join('') : '<div class="empty-state">No messages yet. Say hello.</div>'}
         </div>
@@ -1926,7 +2271,12 @@ function renderMessage(message) {
           ${message.editedAt ? '<span>edited</span>' : ''}
         </div>
         <div class="message__bubble">
-          ${reply ? `<div class="pill" style="margin-bottom:0.5rem;">Replying to ${escapeHtml(reply.senderId?.fullName || 'message')}</div>` : ''}
+          ${reply ? `
+            <div class="message__reply">
+              <div class="message__reply-author">${escapeHtml(reply.senderId?.fullName || 'Reply')}</div>
+              <div class="message__reply-preview">${escapeHtml(formatMessagePreview(reply))}</div>
+            </div>
+          ` : ''}
           ${message.text ? `<p>${escapeHtml(message.text)}</p>` : ''}
           ${isFile ? renderMessageFile(message, outgoing) : ''}
         </div>
@@ -2027,6 +2377,7 @@ function renderGroupsPanel() {
         </div>
         ${group ? `
           <div class="panel__header-actions">
+            <button class="icon-button" type="button" data-action="open-group-details" data-value="${escapeHtml(group._id || '')}" title="Group details"><span class="material-symbols-outlined">info</span></button>
             <button class="surface-button" type="button" data-action="group-invite-code" data-value="${escapeHtml(group._id || '')}">Invite code</button>
             <button class="ghost-button" type="button" data-action="leave-group" data-value="${escapeHtml(group._id || '')}">Leave</button>
           </div>
@@ -2039,6 +2390,14 @@ function renderGroupsPanel() {
               <div class="stat"><div class="muted">Members</div><div class="stat__value">${members.length}</div></div>
               <div class="stat"><div class="muted">Admins only chat</div><div class="stat__value">${group.onlyAdminsCanMessage ? 'Yes' : 'No'}</div></div>
               <div class="stat"><div class="muted">Admins manage members</div><div class="stat__value">${group.onlyAdminsCanAddMembers ? 'Yes' : 'No'}</div></div>
+            </div>
+            <div class="card card--soft">
+              <h3 class="card__title">Permissions</h3>
+              <div class="permissions-grid">
+                <div class="permission-row"><span>Messaging</span><strong>${group.onlyAdminsCanMessage ? 'Admins only' : 'All members'}</strong></div>
+                <div class="permission-row"><span>Edit info</span><strong>${group.onlyAdminsCanEditInfo ? 'Admins only' : 'All members'}</strong></div>
+                <div class="permission-row"><span>Add members</span><strong>${group.onlyAdminsCanAddMembers ? 'Admins only' : 'All members'}</strong></div>
+              </div>
             </div>
             <div class="card">
               <h3 class="card__title">Members</h3>
@@ -2054,11 +2413,18 @@ function renderGroupsPanel() {
                 `).join('')}
               </div>
             </div>
-            <form class="card form" data-form="join-group">
-              <h3 class="card__title">Join by invite code</h3>
-              ${renderField('Invite code', 'inviteCode', 'text', appState.forms['join-group']?.inviteCode || '', 'paste invite code')}
-              <button class="primary-button" type="submit">${appState.loading ? 'Joining...' : 'Join group'}</button>
-            </form>
+            <div class="split">
+              <div class="card form">
+                <h3 class="card__title">Invite members</h3>
+                <p class="muted">Generate a fresh invite code for this group when you need to share access.</p>
+                <button class="surface-button" type="button" data-action="group-invite-code" data-value="${escapeHtml(group._id || '')}">Generate invite code</button>
+              </div>
+              <form class="card form" data-form="join-group">
+                <h3 class="card__title">Join by invite code</h3>
+                ${renderField('Invite code', 'inviteCode', 'text', appState.forms['join-group']?.inviteCode || '', 'paste invite code')}
+                <button class="primary-button" type="submit">${appState.loading ? 'Joining...' : 'Join group'}</button>
+              </form>
+            </div>
           </div>
         ` : '<div class="empty-state">Select a group to see member details and settings.</div>'}
       </div>
@@ -2101,6 +2467,11 @@ function renderFilesPanel() {
                   <div class="list__title">${escapeHtml(file.fileName || 'Shared file')}</div>
                   <div class="list__preview">${escapeHtml(file.mimeType || file.mediaKind || 'file')}</div>
                 </div>
+                <div class="file-card__meta">
+                  <span>${escapeHtml(formatFileSize(file.fileSize || 0))}</span>
+                  ${file.duration ? `<span>${escapeHtml(`${Math.round(file.duration)}s`)}</span>` : ''}
+                  ${file.pages ? `<span>${escapeHtml(`${file.pages} pages`)}</span>` : ''}
+                </div>
                 <div class="topbar__actions">
                   ${file.mediaUrl ? `<a class="surface-button" href="${escapeHtml(file.mediaUrl)}" target="_blank" rel="noreferrer">Open</a>` : ''}
                   <button class="ghost-button" type="button" data-action="open-chat" data-value="${escapeHtml(file.chatId || '')}">Open chat</button>
@@ -2115,6 +2486,8 @@ function renderFilesPanel() {
 }
 
 function renderNotificationsPanel() {
+  const unread = appState.data.notifications.filter((notification) => !notification.isRead);
+  const earlier = appState.data.notifications.filter((notification) => notification.isRead);
   return `
     <section class="panel">
       <div class="panel__header">
@@ -2129,22 +2502,42 @@ function renderNotificationsPanel() {
         </div>
       </div>
       <div class="panel__body">
-        <div class="stack">
-          ${appState.data.notifications.length ? appState.data.notifications.map((notification) => `
-            <button class="notification-row card ${notification.isRead ? '' : 'card--soft'}" data-action="open-notification" data-value="${escapeHtml(notification._id || notification.id || '')}">
-              <div class="list__meta">
-                <div class="list__title-row">
-                  <h3 class="list__title">${escapeHtml(notification.title || notification.type || 'Notification')}</h3>
-                  <span class="list__time">${escapeHtml(formatDate(notification.createdAt))}</span>
-                </div>
-                <div class="list__preview">${escapeHtml(notification.body || '')}</div>
-              </div>
-              ${notification.isRead ? '' : '<span class="badge">New</span>'}
-            </button>
-          `).join('') : '<div class="empty-state">No notifications yet.</div>'}
+        <div class="page">
+          ${unread.length ? `
+            <section class="notification-group">
+              <div class="thread__separator">Unread</div>
+              <div class="stack">${unread.map((notification) => renderNotificationCard(notification)).join('')}</div>
+            </section>
+          ` : ''}
+          ${earlier.length ? `
+            <section class="notification-group">
+              <div class="thread__separator">Earlier</div>
+              <div class="stack">${earlier.map((notification) => renderNotificationCard(notification)).join('')}</div>
+            </section>
+          ` : ''}
+          ${!appState.data.notifications.length ? '<div class="empty-state">No notifications yet.</div>' : ''}
         </div>
       </div>
     </section>
+  `;
+}
+
+function renderNotificationCard(notification) {
+  const visual = getNotificationVisual(notification);
+  return `
+    <button class="notification-row notification-row--${visual.tone} ${notification.isRead ? '' : 'is-unread'}" data-action="open-notification" data-value="${escapeHtml(notification._id || notification.id || '')}">
+      <div class="notification-row__icon">
+        <span class="material-symbols-outlined">${visual.icon}</span>
+      </div>
+      <div class="list__meta">
+        <div class="list__title-row">
+          <h3 class="list__title">${escapeHtml(notification.title || notification.type || 'Notification')}</h3>
+          <span class="list__time">${escapeHtml(formatDate(notification.createdAt))}</span>
+        </div>
+        <div class="list__preview notification-row__preview">${escapeHtml(notification.body || '')}</div>
+      </div>
+      ${notification.isRead ? '' : '<span class="badge">New</span>'}
+    </button>
   `;
 }
 
@@ -2266,6 +2659,8 @@ function renderAdminPanel() {
   }
 
   const dashboard = appState.data.adminDashboard || {};
+  const stats = getDashboardStats(dashboard);
+  const bars = getChartBars(appState.data.adminAnalytics, dashboard);
   return `
     <section class="panel">
       <div class="panel__header">
@@ -2279,12 +2674,32 @@ function renderAdminPanel() {
       <div class="panel__body">
         <div class="page">
           <div class="stats">
-            ${Object.entries(dashboard).slice(0, 4).map(([key, value]) => `
+            ${stats.map((item) => `
               <div class="stat">
-                <div class="muted">${escapeHtml(key)}</div>
-                <div class="stat__value">${escapeHtml(typeof value === 'object' ? JSON.stringify(value) : String(value ?? '0'))}</div>
+                <div class="muted">${escapeHtml(item.label)}</div>
+                <div class="stat__value">${escapeHtml(String(item.value))}</div>
+                <div class="list__preview">${escapeHtml(item.hint)}</div>
               </div>
             `).join('')}
+          </div>
+          <div class="card">
+            <div class="topbar">
+              <div>
+                <h3 class="card__title">Message volume</h3>
+                <div class="muted">Recent daily activity across the workspace.</div>
+              </div>
+            </div>
+            <div class="chart">
+              ${bars.length ? bars.map((bar) => `
+                <div class="chart__item">
+                  <div class="chart__bar-wrap">
+                    <div class="chart__bar" style="height:${bar.height}%"></div>
+                  </div>
+                  <div class="chart__value">${escapeHtml(String(bar.value))}</div>
+                  <div class="chart__label">${escapeHtml(bar.label.slice(5))}</div>
+                </div>
+              `).join('') : '<div class="muted">No analytics yet.</div>'}
+            </div>
           </div>
           <div class="split">
             <div class="card">
@@ -2357,10 +2772,18 @@ function renderMobileTabs() {
   const items = [
     ['messages', 'chat_bubble'],
     ['contacts', 'group'],
+    ['requests', 'person_add'],
     ['groups', 'forum'],
     ['files', 'folder_open'],
     ['notifications', 'notifications'],
+    ['profile', 'account_circle'],
+    ['privacy', 'shield'],
+    ['security', 'security'],
   ];
+
+  if (appState.data.me?.role === 'admin') {
+    items.push(['admin', 'monitoring']);
+  }
 
   return `
     <nav class="mobile-tabs">
@@ -2370,6 +2793,184 @@ function renderMobileTabs() {
         </button>
       `).join('')}
     </nav>
+  `;
+}
+
+function renderDetailsDrawer() {
+  const drawer = appState.detailsDrawer;
+  if (!drawer.open) {
+    return '';
+  }
+
+  return `
+    <div class="details-overlay">
+      <button class="details-overlay__backdrop" type="button" data-action="close-details" aria-label="Close details drawer"></button>
+      <aside class="details-drawer" role="dialog" aria-modal="true" aria-label="Details drawer">
+        ${drawer.kind === 'private' ? renderPrivateDetailsDrawer() : renderGroupDetailsDrawerPanel()}
+      </aside>
+    </div>
+  `;
+}
+
+function renderPrivateDetailsDrawer() {
+  const drawer = appState.detailsDrawer;
+  const details = drawer.data || {};
+  const profile = details.profile || {};
+  const mutualContacts = Array.isArray(details.mutualContacts) ? details.mutualContacts : [];
+  const media = Array.isArray(details.media) ? details.media : [];
+  const presence = profile?._id ? appState.presenceByUser[String(profile._id)] : null;
+
+  return `
+    <div class="details-drawer__header">
+      <div>
+        <h3 class="headline" style="font-size:1.2rem;margin:0;">Contact info</h3>
+        <div class="muted">Profile, mutual contacts, and shared media.</div>
+      </div>
+      <button class="icon-button" type="button" data-action="close-details"><span class="material-symbols-outlined">close</span></button>
+    </div>
+    <div class="details-drawer__body">
+      ${drawer.loading ? '<div class="loading-state">Loading contact details…</div>' : ''}
+      ${drawer.error ? `<div class="error-state">${escapeHtml(drawer.error)}</div>` : ''}
+      ${!drawer.loading && !drawer.error ? `
+        <div class="details-profile">
+          <div class="details-profile__avatar avatar">
+            ${profile.profileImage ? `<img src="${escapeHtml(profile.profileImage)}" alt="${escapeHtml(profile.fullName || 'contact')}" />` : escapeHtml(initials(profile.fullName || 'CT'))}
+            <span class="avatar__presence ${presence?.isOnline || profile.isOnline ? 'is-online' : ''}"></span>
+          </div>
+          <h4>${escapeHtml(profile.fullName || 'Contact')}</h4>
+          <p>${escapeHtml(profile.username ? `@${profile.username}` : (profile.email || 'Private chat'))}</p>
+          <span class="pill">${escapeHtml(profile.isOnline ? 'Active now' : (profile.lastSeen ? `Last seen ${formatDate(profile.lastSeen)}` : 'Offline'))}</span>
+          ${profile.statusMessage ? `<div class="details-quote">${escapeHtml(profile.statusMessage)}</div>` : ''}
+        </div>
+        <div class="details-actions">
+          <button class="surface-button" type="button" data-action="section" data-value="files">Shared files</button>
+          <button class="surface-button" type="button" data-action="clear-chat">Clear chat</button>
+        </div>
+        ${mutualContacts.length ? `
+          <section class="details-section">
+            <div class="details-section__heading">
+              <h4>Mutual contacts</h4>
+              <span>${mutualContacts.length}</span>
+            </div>
+            <div class="details-list">
+              ${mutualContacts.slice(0, 5).map((user) => `
+                <div class="details-list__row">
+                  <div class="avatar">${user.profileImage ? `<img src="${escapeHtml(user.profileImage)}" alt="${escapeHtml(user.fullName || 'user')}" />` : escapeHtml(initials(user.fullName || 'MC'))}</div>
+                  <div class="list__meta">
+                    <div class="list__title">${escapeHtml(user.fullName || 'Contact')}</div>
+                    <div class="list__preview">${escapeHtml(user.username ? `@${user.username}` : 'Mutual contact')}</div>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          </section>
+        ` : ''}
+        <section class="details-section">
+          <div class="details-section__heading">
+            <h4>Shared media</h4>
+            <button class="ghost-button" type="button" data-action="section" data-value="files">View all</button>
+          </div>
+          ${renderDetailsMediaGrid(media)}
+        </section>
+      ` : ''}
+    </div>
+  `;
+}
+
+function renderGroupDetailsDrawerPanel() {
+  const drawer = appState.detailsDrawer;
+  const details = drawer.data || {};
+  const group = details.group || null;
+  const members = Array.isArray(details.members) ? details.members : [];
+  const media = Array.isArray(details.media) ? details.media : [];
+
+  return `
+    <div class="details-drawer__header">
+      <div>
+        <h3 class="headline" style="font-size:1.2rem;margin:0;">Group details</h3>
+        <div class="muted">Members, permissions, and shared media.</div>
+      </div>
+      <button class="icon-button" type="button" data-action="close-details"><span class="material-symbols-outlined">close</span></button>
+    </div>
+    <div class="details-drawer__body">
+      ${drawer.loading ? '<div class="loading-state">Loading group details…</div>' : ''}
+      ${drawer.error ? `<div class="error-state">${escapeHtml(drawer.error)}</div>` : ''}
+      ${!drawer.loading && !drawer.error && group ? `
+        <div class="details-profile">
+          <div class="details-profile__avatar avatar avatar--square">
+            ${group.image ? `<img src="${escapeHtml(group.image)}" alt="${escapeHtml(group.name || 'group')}" />` : escapeHtml(initials(group.name || 'GR'))}
+          </div>
+          <h4>${escapeHtml(group.name || 'Group')}</h4>
+          <p>${escapeHtml(group.description || 'Team conversation')}</p>
+          <span class="pill">${escapeHtml(`${members.length} members`)}</span>
+        </div>
+        <div class="details-actions">
+          <button class="surface-button" type="button" data-action="group-invite-code" data-value="${escapeHtml(group._id || '')}">Invite member</button>
+          <button class="surface-button" type="button" data-action="leave-group" data-value="${escapeHtml(group._id || '')}">Leave group</button>
+        </div>
+        <section class="details-section">
+          <div class="details-section__heading">
+            <h4>Permissions</h4>
+          </div>
+          <div class="details-permissions">
+            <div class="permission-row"><span>Messaging</span><strong>${group.onlyAdminsCanMessage ? 'Admins only' : 'All members'}</strong></div>
+            <div class="permission-row"><span>Edit info</span><strong>${group.onlyAdminsCanEditInfo ? 'Admins only' : 'All members'}</strong></div>
+            <div class="permission-row"><span>Add members</span><strong>${group.onlyAdminsCanAddMembers ? 'Admins only' : 'All members'}</strong></div>
+          </div>
+        </section>
+        <section class="details-section">
+          <div class="details-section__heading">
+            <h4>Members</h4>
+            <span>${members.length}</span>
+          </div>
+          <div class="details-list">
+            ${members.slice(0, 8).map((member) => `
+              <div class="details-list__row">
+                <div class="avatar">${member.userId?.profileImage ? `<img src="${escapeHtml(member.userId.profileImage)}" alt="${escapeHtml(member.userId.fullName || 'member')}" />` : escapeHtml(initials(member.userId?.fullName || 'GM'))}</div>
+                <div class="list__meta">
+                  <div class="list__title">${escapeHtml(member.userId?.fullName || 'Member')}</div>
+                  <div class="list__preview">${escapeHtml(member.role || 'member')}</div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </section>
+        <section class="details-section">
+          <div class="details-section__heading">
+            <h4>Shared media</h4>
+            <button class="ghost-button" type="button" data-action="section" data-value="files">View all</button>
+          </div>
+          ${renderDetailsMediaGrid(media)}
+        </section>
+      ` : ''}
+    </div>
+  `;
+}
+
+function renderDetailsMediaGrid(media) {
+  if (!media.length) {
+    return '<div class="muted">No shared media yet.</div>';
+  }
+
+  return `
+    <div class="details-media-grid">
+      ${media.slice(0, 6).map((item) => {
+        const src = item.thumbnailUrl || item.previewUrl || item.mediaUrl || '';
+        const icon = item.mediaKind === 'image'
+          ? 'image'
+          : item.mediaKind === 'video'
+            ? 'videocam'
+            : item.mediaKind === 'audio'
+              ? 'graphic_eq'
+              : 'description';
+
+        return `
+          <a class="details-media-card" href="${escapeHtml(item.mediaUrl || src || '#')}" target="_blank" rel="noreferrer">
+            ${src ? `<img src="${escapeHtml(src)}" alt="${escapeHtml(item.fileName || 'media')}" />` : `<span class="material-symbols-outlined">${icon}</span>`}
+          </a>
+        `;
+      }).join('')}
+    </div>
   `;
 }
 
