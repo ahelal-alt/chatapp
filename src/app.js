@@ -25,7 +25,6 @@ const reportRoutes = require('./modules/reports/report.routes');
 const adminRoutes = require('./modules/admin/admin.routes');
 
 const app = express();
-const frontendDir = path.resolve(process.cwd(), 'public');
 
 app.use(helmet());
 app.use(cors({ origin: env.clientUrl, credentials: true }));
@@ -36,7 +35,6 @@ app.use(express.urlencoded({ extended: true }));
 app.use(mongoSanitize());
 app.use(apiRateLimit);
 app.use(`/${env.uploadDir}`, express.static(path.resolve(process.cwd(), env.uploadDir)));
-app.use(express.static(frontendDir));
 
 app.get('/health', (req, res) => {
   res.json({
@@ -64,14 +62,6 @@ app.use('/api/v1/reports', reportRoutes);
 app.use('/api/v1/admin', adminRoutes);
 
 setupSwagger(app);
-
-app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api/') || req.path.startsWith(`/${env.uploadDir}/`)) {
-    return next();
-  }
-
-  return res.sendFile(path.join(frontendDir, 'index.html'));
-});
 
 app.use(notFoundHandler);
 app.use(errorHandler);

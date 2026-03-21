@@ -1,50 +1,106 @@
 const { body } = require('express-validator');
+const env = require('../../config/env');
+const { evaluatePassword } = require('../../utils/password');
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeUsername(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function passwordPolicyValidator(value, { req, path }) {
+  const result = evaluatePassword(value, {
+    email: req.body.email,
+    username: req.body.username,
+    fullName: req.body.fullName,
+  });
+
+  if (!result.isValid) {
+    throw new Error(result.reasons[0]);
+  }
+
+  if (path === 'newPassword' && value === String(req.body.currentPassword || '')) {
+    throw new Error('New password must be different from the current password.');
+  }
+
+  return true;
+}
 
 const registerValidation = [
-  body('fullName').trim().notEmpty().withMessage('fullName is required'),
-  body('username')
+  body('fullName')
     .trim()
-    .isLength({ min: 3, max: 30 })
-    .withMessage('username must be between 3 and 30 characters'),
-  body('email').isEmail().withMessage('A valid email is required'),
+    .isLength({ min: 2, max: 120 })
+    .withMessage('Full name must be between 2 and 120 characters long.'),
+  body('email')
+    .customSanitizer(normalizeEmail)
+    .isEmail()
+    .withMessage('Enter a valid email address.'),
+  body('username')
+    .optional({ values: 'falsy' })
+    .customSanitizer(normalizeUsername)
+    .matches(/^[a-z0-9._-]{3,30}$/)
+    .withMessage('Username must be 3 to 30 characters and use letters, numbers, dots, underscores, or dashes.'),
   body('password')
-    .isLength({ min: 8 })
-    .withMessage('password must be at least 8 characters long'),
+    .isString()
+    .withMessage('Password is required.')
+    .custom(passwordPolicyValidator),
+  body('confirmPassword')
+    .isString()
+    .withMessage('Confirm your password.')
+    .custom((value, { req }) => value === req.body.password)
+    .withMessage('Passwords do not match.'),
 ];
 
 const loginValidation = [
-  body('email').isEmail().withMessage('A valid email is required'),
-  body('password').notEmpty().withMessage('password is required'),
+  body('email')
+    .customSanitizer(normalizeEmail)
+    .isEmail()
+    .withMessage('Enter a valid email address.'),
+  body('password').isString().notEmpty().withMessage('Password is required.'),
+  body('rememberMe').optional().isBoolean().withMessage('rememberMe must be true or false.'),
 ];
 
 const changePasswordValidation = [
-  body('currentPassword').notEmpty().withMessage('currentPassword is required'),
-  body('newPassword')
-    .isLength({ min: 8 })
-    .withMessage('newPassword must be at least 8 characters long'),
+  body('currentPassword').isString().notEmpty().withMessage('Current password is required.'),
+  body('newPassword').isString().custom(passwordPolicyValidator),
+  body('confirmNewPassword')
+    .isString()
+    .custom((value, { req }) => value === req.body.newPassword)
+    .withMessage('New passwords do not match.'),
 ];
 
 const forgotPasswordValidation = [
-  body('email').isEmail().withMessage('A valid email is required'),
+  body('email')
+    .customSanitizer(normalizeEmail)
+    .isEmail()
+    .withMessage('Enter a valid email address.'),
 ];
 
 const resetPasswordValidation = [
-  body('token').notEmpty().withMessage('token is required'),
-  body('password')
-    .isLength({ min: 8 })
-    .withMessage('password must be at least 8 characters long'),
+  body('token').isString().notEmpty().withMessage('Reset token is required.'),
+  body('password').isString().custom(passwordPolicyValidator),
+  body('confirmPassword')
+    .isString()
+    .custom((value, { req }) => value === req.body.password)
+    .withMessage('Passwords do not match.'),
 ];
 
 const verifyEmailValidation = [
-  body('token').notEmpty().withMessage('token is required'),
+  body('token').isString().notEmpty().withMessage('Verification token is required.'),
 ];
 
 const resendVerificationValidation = [
-  body('email').optional().isEmail().withMessage('email must be valid'),
+  body('email')
+    .optional({ values: 'falsy' })
+    .customSanitizer(normalizeEmail)
+    .isEmail()
+    .withMessage('Enter a valid email address.'),
 ];
 
 const refreshTokenValidation = [
-  body('refreshToken').notEmpty().withMessage('refreshToken is required'),
+  body('refreshToken').optional().isString().notEmpty().withMessage('refreshToken must be a non-empty string.'),
 ];
 
 module.exports = {
@@ -56,5 +112,7 @@ module.exports = {
   verifyEmailValidation,
   resendVerificationValidation,
   refreshTokenValidation,
+  passwordHints: {
+    minLength: env.auth.passwordMinLength,
+  },
 };
-

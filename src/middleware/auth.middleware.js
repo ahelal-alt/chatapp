@@ -12,9 +12,24 @@ async function authenticate(req, res, next) {
     }
 
     const payload = verifyAccessToken(token);
-    const user = await User.findById(payload.sub);
+    if (payload.type && payload.type !== 'access') {
+      return next(new ApiError(401, 'Invalid authentication token'));
+    }
 
-    if (!user || !user.isActive) {
+    const user = await User.findById(payload.sub).select('+sessionVersion +lockUntil');
+
+    const sessionVersion = user?.sessionVersion || 0;
+    const tokenSessionVersion = payload.sv ?? 0;
+    const accountLocked = Boolean(user?.lockUntil && user.lockUntil > new Date());
+    const accountAvailable = user
+      && user.accountStatus !== 'disabled'
+      && user.accountStatus !== 'deleted'
+      && user.accountStatus !== 'suspended'
+      && user.accountStatus !== 'pending_verification'
+      && !accountLocked
+      && user.isActive;
+
+    if (!user || !accountAvailable || String(sessionVersion) !== String(tokenSessionVersion)) {
       return next(new ApiError(401, 'Invalid authentication token'));
     }
 
@@ -43,4 +58,3 @@ module.exports = {
   authenticate,
   authorize,
 };
-
