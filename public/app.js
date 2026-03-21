@@ -62,6 +62,7 @@ const root = document.getElementById('app');
 const SESSION_KEY = 'pulsechat.session';
 const TOAST_TIMEOUT_MS = 3200;
 let toastTimer = null;
+let refreshPromise = null;
 
 document.addEventListener('click', onDocumentClick);
 document.addEventListener('submit', onDocumentSubmit);
@@ -548,39 +549,49 @@ async function api(path, options = {}) {
 }
 
 async function refreshSession() {
-  if (!appState.session?.refreshToken) {
-    return false;
+  if (refreshPromise) {
+    return refreshPromise;
   }
 
-  try {
-    const response = await fetch('/api/v1/auth/refresh', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        refreshToken: appState.session.refreshToken,
-      }),
-    });
-
-    const payload = await response.json();
-    if (!response.ok || !payload?.data?.tokens) {
-      clearSession();
+  refreshPromise = (async () => {
+  if (!appState.session?.refreshToken) {
       return false;
     }
 
-    appState.session.accessToken = payload.data.tokens.accessToken;
-    appState.session.refreshToken = payload.data.tokens.refreshToken;
-    if (payload.data.user) {
-      appState.data.me = payload.data.user;
+    try {
+      const response = await fetch('/api/v1/auth/refresh', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          refreshToken: appState.session.refreshToken,
+        }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok || !payload?.data?.tokens) {
+        clearSession();
+        return false;
+      }
+
+      appState.session.accessToken = payload.data.tokens.accessToken;
+      appState.session.refreshToken = payload.data.tokens.refreshToken;
+      if (payload.data.user) {
+        appState.data.me = payload.data.user;
+      }
+      persistSession();
+      connectSocket();
+      return true;
+    } catch (error) {
+      clearSession();
+      return false;
+    } finally {
+      refreshPromise = null;
     }
-    persistSession();
-    connectSocket();
-    return true;
-  } catch (error) {
-    clearSession();
-    return false;
-  }
+  })();
+
+  return refreshPromise;
 }
 
 function connectSocket() {
