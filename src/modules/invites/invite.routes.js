@@ -1,10 +1,37 @@
 const express = require('express');
-const { authenticate } = require('../../middleware/auth.middleware');
+const { authenticate, authenticateOptional } = require('../../middleware/auth.middleware');
 const validateRequest = require('../../middleware/validate.middleware');
 const controller = require('./invite.controller');
 const validation = require('./invite.validation');
 
 const router = express.Router();
+
+router.get(
+  '/public/:token',
+  authenticateOptional,
+  validation.publicInviteTokenValidation,
+  validateRequest,
+  controller.getPublicInvite,
+);
+router.post(
+  '/public/:token/register',
+  validation.publicInviteRegisterValidation,
+  validateRequest,
+  controller.registerFromPublicInvite,
+);
+router.post(
+  '/public/:token/login',
+  validation.publicInviteLoginValidation,
+  validateRequest,
+  controller.loginFromPublicInvite,
+);
+router.post(
+  '/public/:token/accept',
+  authenticateOptional,
+  validation.publicInviteTokenValidation,
+  validateRequest,
+  controller.acceptPublicInvite,
+);
 
 router.use(authenticate);
 

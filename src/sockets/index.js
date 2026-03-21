@@ -4,6 +4,7 @@ const { verifyAccessToken } = require('../utils/token');
 const notificationService = require('../modules/notifications/notification.service');
 const { registerPresenceSocket, setPresence } = require('./presence.socket');
 const { registerChatSocket } = require('./chat.socket');
+const { registerCallSocket } = require('./call.socket');
 const { registerNotificationSocket } = require('./notification.socket');
 const { addUserSocket, removeUserSocket } = require('./state');
 
@@ -46,6 +47,7 @@ function registerSocketHandlers(io) {
 
     registerPresenceSocket(io, socket);
     registerChatSocket(io, socket);
+    registerCallSocket(io, socket);
     registerNotificationSocket(io, socket);
 
     socket.on('disconnect', async () => {

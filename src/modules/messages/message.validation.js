@@ -10,6 +10,12 @@ const sendMessageValidation = [
   body('fileName').optional().isString().isLength({ min: 1, max: 255 }),
   body('fileSize').optional().isInt({ min: 0, max: 1024 * 1024 * 100 }),
   body('duration').optional().isFloat({ min: 0, max: 60 * 60 * 4 }),
+  body('width').optional().isInt({ min: 1, max: 20000 }),
+  body('height').optional().isInt({ min: 1, max: 20000 }),
+  body('aspectRatio').optional().isFloat({ min: 0.01, max: 100 }),
+  body('pages').optional().isInt({ min: 1, max: 100000 }),
+  body('extension').optional().isString().isLength({ min: 1, max: 20 }),
+  body('metadataProcessingStatus').optional().isIn(['pending', 'complete', 'partial', 'failed', 'unsupported', 'legacy']),
   body('mediaUrl')
     .optional()
     .custom((value) => isValidUrlOrUploadPath(value))

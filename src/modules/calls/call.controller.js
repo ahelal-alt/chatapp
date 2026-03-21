@@ -17,9 +17,29 @@ const getCall = asyncHandler(async (req, res) => {
   res.json(new ApiResponse('Call fetched successfully', call));
 });
 
+const acceptCall = asyncHandler(async (req, res) => {
+  const call = await service.acceptCall(req.user._id, req.params.callId);
+  res.json(new ApiResponse('Call accepted successfully', call));
+});
+
+const rejectCall = asyncHandler(async (req, res) => {
+  const call = await service.rejectCall(req.user._id, req.params.callId);
+  res.json(new ApiResponse('Call rejected successfully', call));
+});
+
 const joinCall = asyncHandler(async (req, res) => {
   const call = await service.joinCall(req.user._id, req.params.callId);
   res.json(new ApiResponse('Call joined successfully', call));
+});
+
+const updateParticipantState = asyncHandler(async (req, res) => {
+  const call = await service.updateParticipantState(req.user._id, req.params.callId, req.body.state);
+  res.json(new ApiResponse('Call participant state updated successfully', call));
+});
+
+const syncCall = asyncHandler(async (req, res) => {
+  const call = await service.syncCall(req.user._id, req.params.callId);
+  res.json(new ApiResponse('Call synced successfully', call));
 });
 
 const leaveCall = asyncHandler(async (req, res) => {
@@ -36,7 +56,11 @@ module.exports = {
   createCall,
   listCalls,
   getCall,
+  acceptCall,
+  rejectCall,
   joinCall,
+  updateParticipantState,
+  syncCall,
   leaveCall,
   endCall,
 };

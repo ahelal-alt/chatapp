@@ -82,6 +82,31 @@ const messageSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    width: {
+      type: Number,
+      default: null,
+    },
+    height: {
+      type: Number,
+      default: null,
+    },
+    aspectRatio: {
+      type: Number,
+      default: null,
+    },
+    pages: {
+      type: Number,
+      default: null,
+    },
+    extension: {
+      type: String,
+      default: '',
+    },
+    metadataProcessingStatus: {
+      type: String,
+      enum: ['pending', 'complete', 'partial', 'failed', 'unsupported', 'legacy'],
+      default: 'legacy',
+    },
     isEncrypted: {
       type: Boolean,
       default: false,

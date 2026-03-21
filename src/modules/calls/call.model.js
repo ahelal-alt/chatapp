@@ -7,6 +7,19 @@ const callParticipantSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
+    state: {
+      type: String,
+      enum: ['ringing', 'connecting', 'connected', 'declined', 'left', 'ended', 'missed'],
+      default: 'ringing',
+    },
+    invitedAt: {
+      type: Date,
+      default: null,
+    },
+    answeredAt: {
+      type: Date,
+      default: null,
+    },
     joinedAt: {
       type: Date,
       default: null,
@@ -40,8 +53,8 @@ const callSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['pending', 'active', 'ended', 'missed'],
-      default: 'pending',
+      enum: ['ringing', 'connecting', 'connected', 'declined', 'ended', 'missed'],
+      default: 'ringing',
       index: true,
     },
     participants: {
@@ -51,6 +64,10 @@ const callSchema = new mongoose.Schema(
     startedAt: {
       type: Date,
       default: null,
+    },
+    signalingVersion: {
+      type: Number,
+      default: 0,
     },
     endedAt: {
       type: Date,

@@ -90,6 +90,17 @@ async function prepareVerification(user) {
   return verificationToken;
 }
 
+async function trustUserEmail(user) {
+  user.isVerified = true;
+  user.isEmailVerified = true;
+  user.verificationTokenHash = null;
+  user.verificationTokenExpiresAt = null;
+  user.verificationEmailSentAt = null;
+  user.accountStatus = 'active';
+  user.isActive = true;
+  await user.save();
+}
+
 async function issueAuthTokens(user, options = {}) {
   const rememberMe = Boolean(options.rememberMe);
   const tokenId = generateTokenId();
@@ -269,8 +280,8 @@ function ensureActiveLoginState(user) {
   }
 }
 
-async function register(payload, context = {}) {
-  const emailNormalized = normalizeEmail(payload.email);
+async function register(payload, context = {}, options = {}) {
+  const emailNormalized = normalizeEmail(options.forcedEmail || payload.email);
   const username = await ensureUniqueUsername(
     payload.username,
     payload.fullName?.replace(/\s+/g, '.') || emailNormalized.split('@')[0],
@@ -292,7 +303,9 @@ async function register(payload, context = {}) {
     throw new ApiError(422, passwordReview.reasons[0]);
   }
 
-  const shouldRequireVerification = env.auth.requireEmailVerification;
+  const shouldRequireVerification = options.skipEmailVerification
+    ? false
+    : env.auth.requireEmailVerification;
   const user = await User.create({
     fullName: String(payload.fullName || '').trim(),
     username,
@@ -305,6 +318,7 @@ async function register(payload, context = {}) {
     isActive: !shouldRequireVerification,
     lastPasswordChangedAt: new Date(),
     sessionVersion: 0,
+    createdBy: options.createdBy || null,
   });
 
   await PrivacySettings.create({ userId: user._id });
@@ -335,8 +349,8 @@ async function register(payload, context = {}) {
   return buildAuthPayload(user, sessionData);
 }
 
-async function login(payload, context = {}) {
-  const emailNormalized = normalizeEmail(payload.email);
+async function login(payload, context = {}, options = {}) {
+  const emailNormalized = normalizeEmail(options.forcedEmail || payload.email);
   const user = await User.findOne(buildEmailLookup(emailNormalized))
     .select('+passwordHash +failedLoginAttempts +lockUntil +sessionVersion');
 
@@ -358,6 +372,10 @@ async function login(payload, context = {}) {
   if (!passwordMatches) {
     await recordFailedLogin(user, { ...context, email: emailNormalized });
     throw new ApiError(401, GENERIC_AUTH_FAILURE_MESSAGE);
+  }
+
+  if (deriveActiveStatus(user) === 'pending_verification' && options.skipEmailVerification) {
+    await trustUserEmail(user);
   }
 
   ensureActiveLoginState(user);
@@ -506,14 +524,7 @@ async function verifyEmail(payload, context = {}) {
     throw new ApiError(400, 'Invalid or expired verification token');
   }
 
-  user.isVerified = true;
-  user.isEmailVerified = true;
-  user.verificationTokenHash = null;
-  user.verificationTokenExpiresAt = null;
-  user.verificationEmailSentAt = null;
-  user.accountStatus = 'active';
-  user.isActive = true;
-  await user.save();
+  await trustUserEmail(user);
 
   const sessionData = await issueAuthTokens(user, { context });
 
@@ -739,4 +750,5 @@ module.exports = {
   revokeSession,
   deactivateAccount,
   deleteAccount,
+  normalizeEmail,
 };

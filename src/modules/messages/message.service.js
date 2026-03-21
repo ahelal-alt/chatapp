@@ -7,6 +7,7 @@ const ApiError = require('../../utils/ApiError');
 const notificationService = require('../notifications/notification.service');
 const { getPagination, buildPaginationMeta } = require('../../utils/pagination');
 const { escapeRegex } = require('../../utils/validation');
+const { getMediaKindFromMime, isPreviewableMediaKind, normalizeMediaMetadata } = require('../../utils/media');
 const { getIO } = require('../../sockets/state');
 const { getMessagingPrivacySettings } = require('../../utils/privacy');
 const {
@@ -27,24 +28,38 @@ function hasMessagePayload(payload) {
 }
 
 function buildMediaKind(message) {
-  if (message.type === 'image' || message.mimeType?.startsWith('image/')) {
-    return 'image';
-  }
-  if (message.type === 'video' || message.mimeType?.startsWith('video/')) {
-    return 'video';
-  }
-  if (message.type === 'voice' || message.type === 'audio' || message.mimeType?.startsWith('audio/')) {
+  if (message.type === 'voice') {
     return 'audio';
   }
-  if (message.mimeType === 'application/pdf'
-    || message.mimeType?.includes('document')
-    || message.mimeType?.includes('sheet')
-    || message.mimeType?.includes('presentation')
-    || message.mimeType?.startsWith('text/')) {
-    return 'document';
+  if (message.type && ['image', 'video', 'audio'].includes(message.type)) {
+    return message.type;
   }
+  return getMediaKindFromMime(message.mimeType || '');
+}
 
-  return 'other';
+function buildMediaResponsePayload(message) {
+  const mediaKind = buildMediaKind(message);
+  const metadata = normalizeMediaMetadata({
+    ...message,
+    mediaKind,
+    previewable: message.previewable ?? isPreviewableMediaKind(mediaKind, message.mimeType || ''),
+    previewUrl: message.previewUrl || message.mediaUrl || '',
+  });
+
+  return {
+    ...message,
+    mediaKind,
+    previewable: metadata.previewable,
+    previewUrl: metadata.previewUrl,
+    thumbnailUrl: metadata.thumbnailUrl,
+    width: metadata.width,
+    height: metadata.height,
+    aspectRatio: metadata.aspectRatio,
+    duration: metadata.duration,
+    extension: metadata.extension,
+    pages: metadata.pages,
+    metadataProcessingStatus: metadata.metadataProcessingStatus,
+  };
 }
 
 async function assertCanSendToChat(chat, senderId) {
@@ -148,6 +163,12 @@ async function createMessage(senderId, payload) {
     fileName: payload.fileName || '',
     fileSize: payload.fileSize || 0,
     duration: payload.duration || 0,
+    width: payload.width ?? null,
+    height: payload.height ?? null,
+    aspectRatio: payload.aspectRatio ?? null,
+    pages: payload.pages ?? null,
+    extension: payload.extension || '',
+    metadataProcessingStatus: payload.metadataProcessingStatus || 'legacy',
     isEncrypted,
     ciphertext: payload.ciphertext || '',
     ciphertextIv: payload.ciphertextIv || '',
@@ -380,10 +401,7 @@ async function listSharedFiles(userId, query) {
   ]);
 
   return {
-    items: items.map((item) => ({
-      ...item.toObject(),
-      mediaKind: buildMediaKind(item),
-    })),
+    items: items.map((item) => buildMediaResponsePayload(item.toObject())),
     meta: buildPaginationMeta({ page, limit, total }),
   };
 }
@@ -415,9 +433,7 @@ async function getMediaDetails(userId, messageId) {
   }
 
   return {
-    ...message.toObject(),
-    mediaKind: buildMediaKind(message),
-    previewable: ['image', 'video', 'audio'].includes(buildMediaKind(message)),
+    ...buildMediaResponsePayload(message.toObject()),
   };
 }
 
@@ -562,6 +578,12 @@ async function forwardMessage(userId, messageId, targetChatId) {
     fileName: originalMessage.fileName,
     fileSize: originalMessage.fileSize,
     duration: originalMessage.duration,
+    width: originalMessage.width,
+    height: originalMessage.height,
+    aspectRatio: originalMessage.aspectRatio,
+    pages: originalMessage.pages,
+    extension: originalMessage.extension,
+    metadataProcessingStatus: originalMessage.metadataProcessingStatus,
     latitude: originalMessage.latitude,
     longitude: originalMessage.longitude,
     forwardedFromMessageId: messageId,

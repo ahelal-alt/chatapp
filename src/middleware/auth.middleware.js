@@ -40,6 +40,43 @@ async function authenticate(req, res, next) {
   }
 }
 
+async function authenticateOptional(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return next();
+    }
+
+    const payload = verifyAccessToken(token);
+    if (payload.type && payload.type !== 'access') {
+      return next();
+    }
+
+    const user = await User.findById(payload.sub).select('+sessionVersion +lockUntil');
+
+    const sessionVersion = user?.sessionVersion || 0;
+    const tokenSessionVersion = payload.sv ?? 0;
+    const accountLocked = Boolean(user?.lockUntil && user.lockUntil > new Date());
+    const accountAvailable = user
+      && user.accountStatus !== 'disabled'
+      && user.accountStatus !== 'deleted'
+      && user.accountStatus !== 'suspended'
+      && !accountLocked
+      && user.isActive;
+
+    if (!user || !accountAvailable || String(sessionVersion) !== String(tokenSessionVersion)) {
+      return next();
+    }
+
+    req.user = user;
+    return next();
+  } catch (error) {
+    return next();
+  }
+}
+
 function authorize(...roles) {
   return (req, res, next) => {
     if (!req.user) {
@@ -56,5 +93,6 @@ function authorize(...roles) {
 
 module.exports = {
   authenticate,
+  authenticateOptional,
   authorize,
 };
